@@ -165,8 +165,19 @@ Recorded run, 2026-10-08, zaza (NixOS, codex-cli 0.160.0 from the system profile
 | desktop hangs up, phone continues | phone answered "Yes." |
 | new desktop call while the phone is live, then the phone hangs up | new thread, ready in 1.51 s; it answered "Yep, I'm here. Yes." |
 
+Deployed run, 2026-10-08: the same scenario through a Hermes dashboard (v0.21.6 Nix build) serving
+the installed plugin at commit `9366f20`, using `--url` and the dashboard's loopback session token.
+Every check passed; the three calls were ready in 1.47 s, 1.53 s and 1.84 s, with broker startup
+(app-server, thread, realtime start, SDP answer) of 0.93–1.35 s, almost all of it the SDP answer.
+Twelve more concurrent starts through that dashboard were ready in 1.5–3.0 s. Two earlier
+runs through a dashboard each had one slow call (12.9 s and 17.1 s from request to `session.started`)
+before the broker logged its startup breakdown; neither repeated, so their cause is unknown. Each
+start now logs `codex live: call … startup …s (…)` so a slow one shows whether the broker or the
+service took the time.
+
 This is live evidence for one account and one machine, with synthetic speech over a direct WebRTC
-client. It does not cover the Hermes Desktop renderer, a phone, echo on a loudspeaker, or other plans.
+client. It does not cover the Hermes Desktop renderer, a phone, echo on a loudspeaker, other plans,
+or Danish speech (espeak-ng's Danish was transcribed as English).
 
 ## Reference implementation
 

@@ -219,7 +219,8 @@ emits per-thread events; it proves the broker's routing, not the subscription se
 
 `tools/live_call_check.py` is the live counterpart: two WebRTC reference clients make overlapping
 **real** calls on the local Codex login (it spends voice allowance) and check delegation, barge-in,
-hang-up in both directions and the backing-thread guard. See the recipe for the last recorded run. CI additionally verifies the bundled fallback imports on a
+hang-up in both directions and the backing-thread guard, either in-process or through a running
+dashboard (`--url`). See the recipe for the recorded runs. CI additionally verifies the bundled fallback imports on a
 clean environment (empty `HOME`, no site-packages), compiles the backend, syntax-checks the
 desktop half and runs the ESM load harness.
 
