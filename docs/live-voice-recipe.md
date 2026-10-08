@@ -2,7 +2,7 @@
 
 How this plugin runs **full-duplex GPT-Live-1 voice on a ChatGPT/Codex subscription**, with no API
 key on the voice lane. Everything below was verified end-to-end against a real offer (SDP), real
-audio and real events (September 2026, `codex-cli 0.154`).
+audio and real events (September 2026, `codex-cli 0.154`; broker flow re-verified October 2026 on `0.160.0`).
 
 ## The idea
 
@@ -23,17 +23,31 @@ ever leave the host: the app-server uses the local `codex login` (`~/.codex/auth
 ## Broker flow (server side)
 
 ```
-initialize {capabilities:{experimentalApi:true}}
-thread/start  { cwd, modelProvider: "openai", model? }          # model optional (see gotchas)
+codex app-server --listen stdio:// --enable realtime_conversation \
+  --disable apps --disable plugins --disable shell_tool --disable unified_exec \
+  --disable browser_use --disable computer_use --disable image_generation \
+  --disable multi_agent --disable view_image --disable hooks \
+  -c model_provider=openai -c 'web_search="disabled"'
+initialize {capabilities:{experimentalApi:true}}                 # once per process; userAgent carries the version
+# per call:
+thread/start  { cwd: <empty private dir>, modelProvider: "openai", model?,
+                ephemeral: true, environments: [], sandbox: "read-only", approvalPolicy: "untrusted" }
+# check the response echoes ephemeral, environments [], sandbox readOnly without network, approvalPolicy
 thread/realtime/start {
   threadId, transport: { type: "webrtc", sdp: <client offer> },
   outputModality: "audio", version: "v3", voice: "cove",
   prompt: <persona>, realtimeStartInstructions: <agent hints>,
-  clientManagedHandoffs: <bool>, delegationAckFiller: true
+  clientManagedHandoffs: true, delegationAckFiller: true
 }
-# notifications: thread/realtime/sdp → { sdp: <answer> } ; thread/realtime/started → { realtimeSessionId }
-thread/realtime/stop { threadId }                                # hang up
+# notifications, each carrying threadId: thread/realtime/sdp → { sdp: <answer> } ;
+# thread/realtime/started → { realtimeSessionId } ; thread/realtime/error ; thread/realtime/closed
+thread/realtime/stop { threadId }                                # hang up this call only
 ```
+
+Every response is matched to its request by JSON-RPC id and every notification to its call by
+`threadId`; notifications for a thread with no live call are dropped. Do not cache a thread between
+calls: a reused thread carries the previous call's context, and stopping "the" thread stops whichever
+call happens to be on it.
 
 The client renderer does: `RTCPeerConnection` + `createDataChannel("oai-events")` + mic track →
 `createOffer()` → POST the SDP to the broker → `setRemoteDescription(answer)`.
@@ -78,6 +92,7 @@ The **executor** is chosen when starting the session:
   so it executes with the user's own models/providers.)
 - `clientManagedHandoffs: false` → the **core** routes the delegation into the Codex thread agent
   and streams its output back into the session (observable as `delegation.context.appended` events).
+  This broker never uses it: tasks must run in Hermes, not in a Codex thread.
 - `delegationAckFiller: true` lets the model fill the wait with natural phrases (“let me check…”).
 
 Notes: the `content` text carries the user's request when it came from real audio; with text-only
@@ -94,19 +109,29 @@ working result channel.
   provider proxy like `nousportal/…`), the thread agent fails with
   `"<model>" is not supported when using Codex with a ChatGPT account`. Force a valid model at
   `thread/start` (`gpt-5.6-sol`, `gpt-5.6-terra`, … — see the Codex model catalog).
-- **Thread lifecycle**: on `thread not found` (app-server restarted) → recreate the thread; on
-  `already` (stale realtime session on the thread) → `thread/realtime/stop` + retry once.
+- **Thread lifecycle**: one fresh ephemeral thread per call, never reused, so `thread not found` and
+  `already running` cannot come from another call. If the app-server process exits, every call it
+  served fails and the next call starts a new process (`initialize` takes about 2 s cold).
 - **Voice allowance**: desktop/Codex voice runs on a **separate rolling 5-hour allowance** per plan
   (Plus ≈ 15–30 min, Pro 5x ≈ 1–2.5 h, Pro 20x unlimited). The plan-side counter is **not exposed**
   to clients (checked `wham/usage`, `account/rateLimits/read`, session events — `usage_limit` stays
   `null`), so metering is done locally from `audio_duration_ms`.
 - **Phantom tool work (plan drain)**: `clientManagedHandoffs: true` only gates whether the thread's
-  output streams back — the core **still routes every delegation into the Codex thread**, where the
-  agent runs real tool work in the background (file reads, shell, `custom_tool_call`s) on the user's
-  plan. Observed: dozens of hidden tool calls per call session and a visible jump in the weekly
-  bucket. Fix: in client mode pass `realtimeStartInstructions` telling the thread agent to reply
-  `skip` without tools; use real instructions only in server mode (the thread is the executor
-  there). Verified: routes still occur, **0 tool calls**.
+  output streams back — the core **still routes every delegation into the Codex thread** (re-checked
+  on 0.160.0: a `turn/started` with a `<realtime_delegation>` user message follows each
+  `delegation.created`), where the agent can run real tool work in the background on the user's plan.
+  A `skip`-without-tools instruction reduces this but is only a prompt. The broker enforces it
+  instead: restricted thread (no environments, read-only, no network, untrusted approvals that it
+  declines), tool features disabled on the app-server, and `turn/interrupt` sent for every backing
+  turn as it starts. Verified on 0.160.0: the backing turn ends `interrupted` with **0 items** about
+  0.1 s after it starts, and the voice still speaks the client's `delegation.context.append` result.
+- **`turn.done` is not guaranteed**: a reply can stream `output_transcript.added` deltas and never
+  get its `turn.done` (seen once in four live runs on 0.160.0). Treat a reply as finished after a
+  quiet gap, not only on `turn.done`.
+- **`/codexlive/interrupt` does not stop speech on 0.160.0**: the realtime turn ids from the data
+  channel (`turn_…`) are not Codex turns, so `turn/interrupt` answers `no active turn to interrupt`
+  (or names the thread's last backing turn). Spoken barge-in works without it: the service cuts its
+  reply when the user talks. The route stays scoped to its own call.
 - **Delegation quality**: with no voice-side policy the model delegates *everything* (fragments,
   fillers, "aló") — each becomes a full agent turn, and users interrupt turns while waiting. Put a
   labelled **delegation policy** in the session instructions (delegate only action / fact requests;
@@ -121,10 +146,33 @@ working result channel.
   (`node --check file.mjs`) **plus** a stub-import harness — `node --check file.js` can false-OK an
   ES module. See `tools/plugin-load-test.sh`.
 
+## Live verification (codex-cli 0.160.0)
+
+`tools/live_call_check.py` runs two WebRTC reference clients (aiortc) against this broker's routes,
+in-process, on a real ChatGPT Plus Codex login. Utterances were synthesized with `espeak-ng -v en-us`:
+"Please check how much free disk space the server has." (delegate), "Hi there. What is two plus
+two?" (chat), "Please tell me a long and detailed story about a lighthouse keeper and his cat."
+(story), "Stop. Wait. What colour is the sky?" (bargein), "Are you still there? Say yes." (still).
+
+Recorded run, 2026-10-08, zaza (NixOS, codex-cli 0.160.0 from the system profile):
+
+| check | result |
+|---|---|
+| two calls started together, separate threads | ready (SDP applied → `session.started`) in 1.91 s and 2.59 s |
+| phone delegation answered by the client while the desktop chatted | phone: "…The server has forty-two gigabytes free."; desktop: "Two plus two is four."; the desktop saw no delegation |
+| backing turn for the delegation | interrupted after ~0.1 s with 0 items; no execution item, no approval request |
+| spoken barge-in on each call | each reply was cut and the new question answered; the other call saw no events meanwhile |
+| desktop hangs up, phone continues | phone answered "Yes." |
+| new desktop call while the phone is live, then the phone hangs up | new thread, ready in 1.51 s; it answered "Yep, I'm here. Yes." |
+
+This is live evidence for one account and one machine, with synthetic speech over a direct WebRTC
+client. It does not cover the Hermes Desktop renderer, a phone, echo on a loudspeaker, or other plans.
+
 ## Reference implementation
 
 - `desktop/plugin.js` — renderer half (WebRTC, transcript, delegation, settings UI).
-- `dashboard/plugin_api.py` — broker half (app-server lifecycle, sessions, personas, usage).
+- `dashboard/plugin_api.py` — broker half (app-server lifecycle, call ownership, sessions, personas, usage).
+- `tools/live_call_check.py` — two-client live check (real calls, spends voice allowance).
 
 ## License note
 

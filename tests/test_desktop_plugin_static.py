@@ -48,11 +48,11 @@ def test_no_rest_call_pre_stringifies_its_body():
 
 
 def test_interrupt_call_sends_object_body():
-    """#7: /codexlive/interrupt must pass a plain object body (and a timeout)."""
+    """#7: /codexlive/interrupt must pass a plain object body naming its own call (and a timeout)."""
     calls = [c for c in _rest_calls(_src()) if "/codexlive/interrupt" in c]
     assert len(calls) == 1, calls
     call = calls[0]
-    assert re.search(r"body:\s*\{\s*turnId:\s*tid\s*\}", call), call
+    assert re.search(r"body:\s*\{\s*turnId:\s*tid,\s*threadId:\s*refs\.threadId\s*\}", call), call
     assert "timeoutMs" in call, call
 
 

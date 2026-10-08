@@ -32,8 +32,10 @@ const effVoiceFor = (engine, stored) => {
 }
 const SENTINEL_DEFAULT = '__default'
 const SENTINEL_HOST = '__host'
-const EN = String((typeof navigator !== 'undefined' && navigator.language) || 'es').toLowerCase().indexOf('en') === 0
-const tr = (es, en) => (EN ? en : es)
+// The UI and every model-facing message are English. The voice speaks English or Danish:
+// Danish by default on a Danish locale, otherwise English (the backend never uses another language).
+const VOICE_LANG = String((typeof navigator !== 'undefined' && navigator.language) || 'en').toLowerCase().indexOf('da') === 0 ? 'da' : 'en'
+const tr = (es, en) => en
 
 // A POST to /api/plugins/talk-desktop/* that the dashboard does not route (backend half not
 // loaded) falls into its GET-only SPA catch-all and comes back as a bare "Method Not Allowed"
@@ -160,9 +162,7 @@ let _delegating = null
 
 // Voz → Chat: envía la petición al chat ENFOCADO (el agente real responde ahí,
 // streaming visible en la ventana) y devuelve el texto de la respuesta para leerlo.
-const _voiceNote = () => (EN
-  ? '[voice] Reply briefly and naturally in the user’s language so it can be READ ALOUD (2-4 sentences, no markdown or lists). The text is dictated and may contain errors, use the latest intent. Do not claim something is done before it actually is.\n\n'
-  : '[voz] Responde breve y natural en el idioma del usuario para LEER EN VOZ ALTA (2-4 frases, sin markdown ni listas). El texto es dictado y puede tener errores; usa la última intención. No afirmes que algo quedó hecho antes de hacerlo.\n\n')
+const _voiceNote = () => '[voice] Reply briefly and naturally in the user’s language (English or Danish) so it can be READ ALOUD (2-4 sentences, no markdown or lists). The text is dictated and may contain errors, use the latest intent. Do not claim something is done before it actually is.\n\n'
 
 async function delegateToChat(text) {
   const req = String(text || '').trim()
@@ -227,7 +227,7 @@ async function runVoiceTool(ctx, callId, name, args, dc) {
     output = await delegateToChat(String((args && (args.request || args.text)) || ''))
   } else {
     try {
-      const r = await ctx.rest('/tool', { method: 'POST', body: { language: EN ? 'en' : 'es', name: name, arguments: args || {} }, timeoutMs: 125000 })
+      const r = await ctx.rest('/tool', { method: 'POST', body: { language: VOICE_LANG, name: name, arguments: args || {} }, timeoutMs: 125000 })
       output = (r && r.output) || ''
     } catch (e) {
       output = tr('La herramienta ', 'The tool ') + name + tr(' falló: ', ' failed: ') + String((e && e.message) || e).slice(0, 160)
@@ -338,7 +338,7 @@ function _runDelegation(ctx, dc, itemId, req) {
 let currentBotTurnId = ''
 let _lastBargeAt = 0
 let _botSpeakingSince = 0
-let _liveRefs = null  // { pc, audioEl, ctx } — set por startLive
+let _liveRefs = null  // { pc, audioEl, ctx, threadId } — set por startLive
 
 function doBargeIn() {
   const now = Date.now()
@@ -353,11 +353,11 @@ function doBargeIn() {
   try { if (refs && refs.audioEl) { refs.audioEl.pause(); refs.audioEl.currentTime = 0; refs.audioEl.play().catch(() => {}) } } catch {}
   bus.set({ spkBot: false, remoteLevel: 0, remBands: null })
   pushTranscript('sys', tr('interrumpido — te escucho', 'interrupted — I am listening'))
-  if (!refs || !hadTurn) return
+  if (!refs || !hadTurn || !refs.threadId) return
   const tid = currentBotTurnId
   currentBotTurnId = ''
   ;(async () => {
-    try { await refs.ctx.rest('/codexlive/interrupt', { method: 'POST', body: { turnId: tid }, timeoutMs: 5000 }) } catch {}
+    try { await refs.ctx.rest('/codexlive/interrupt', { method: 'POST', body: { turnId: tid, threadId: refs.threadId }, timeoutMs: 5000 }) } catch {}
   })()
 }
 
@@ -472,7 +472,7 @@ function playChime(kind) {
 async function mintSession(ctx, profile, voice, allowChat) {
   const sess = await ctx.rest('/session', {
     method: 'POST',
-    body: { language: EN ? 'en' : 'es', profile: profile || null, voice: voice || null, allowChat: allowChat !== false },
+    body: { language: VOICE_LANG, profile: profile || null, voice: voice || null, allowChat: allowChat !== false },
     timeoutMs: 45000
   })
   if (!sess || !sess.clientSecret) throw new Error('respuesta sin clientSecret: ' + JSON.stringify(sess).slice(0, 120))
@@ -606,7 +606,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
   if (eng === 'codex') {
     const r2 = await ctx.rest('/codexlive/session', {
       method: 'POST',
-      body: { language: EN ? 'en' : 'es', profile: profile || null, voice: voice || 'cove', offer: offer.sdp },
+      body: { language: VOICE_LANG, profile: profile || null, voice: voice || 'cove', offer: offer.sdp },
       timeoutMs: 120000
     })
     if (!r2 || !r2.answer) {
@@ -615,7 +615,7 @@ async function startLive(ctx, { profile, voice, micId, outId, engine, log }) {
     }
     codexSession = r2
     handoffMode = (r2.handoff === 'server') ? 'server' : 'client'
-    if (r2.handoffDegraded) pushTranscript('sys', tr('Aviso: este servidor no soporta clientManagedHandoffs; las tareas de voz pueden ejecutarse en el lane ChatGPT del agente en vez de tu chat.', 'Notice: this server does not support clientManagedHandoffs; voice tasks may run on the agent ChatGPT lane instead of your chat.'))
+    if (_liveRefs) _liveRefs.threadId = r2.threadId || null
     bus.botName = r2.botName || bus.botName || ''
     await pc.setRemoteDescription({ type: 'answer', sdp: r2.answer })
   } else {
@@ -859,7 +859,7 @@ async function _pvGenerate(ctx, { engine, voice, profile, micId, outId }) {
   await pc.setLocalDescription(offer)
   let threadId = null
   if (eng === 'codex') {
-    const r = await ctx.rest('/codexlive/session', { method: 'POST', body: { language: EN ? 'en' : 'es', profile: profile || null, voice, offer: offer.sdp }, timeoutMs: 120000 })
+    const r = await ctx.rest('/codexlive/session', { method: 'POST', body: { language: VOICE_LANG, profile: profile || null, voice, offer: offer.sdp }, timeoutMs: 120000 })
     if (!r || !r.answer) throw new Error(tr('muestra: sin SDP de respuesta', 'sample: no answer SDP'))
     threadId = r.threadId || null
     await pc.setRemoteDescription({ type: 'answer', sdp: r.answer })

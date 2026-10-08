@@ -1,32 +1,35 @@
 # Model context language
 
-The desktop uses its existing `EN` flag (`navigator.language` starts with `en`;
-otherwise Spanish). It sends `language: "en"` or `"es"` on `/session`,
-`/codexlive/session`, and `/tool`, including voice previews. The backend selects
-text per request. Missing or unrecognized language values use Spanish. Codex
-thread reuse includes the language so a different locale starts a new thread.
+The voice speaks **English or Danish**, never another language.
 
-Localized text covers the chat prefix, spoken acknowledgement instruction,
-delegation results and statuses (including errors, timeouts, empty results,
-disabled tasks, queued work, and stale work), omitted-code marker, preview
-instruction and sample, backend persona and chat instructions, Codex delegation
-and skip instructions, language directive, and tool errors/timeouts. Protocol
-identifiers, including `skip` and `<realtime_delegation>`, remain unchanged.
+The desktop sets `VOICE_LANG` from `navigator.language`: `da` when the locale
+starts with `da`, otherwise `en`. It sends that value as `language` on
+`/session`, `/codexlive/session`, and `/tool`, including voice previews. The
+backend maps `da` to Danish and every other value, including a missing or
+unrecognized one, to English. That value only chooses the call's default spoken
+language: the language directive tells the model to answer Danish speech in
+Danish and English speech in English, and to fall back to the default for any
+other language or an unclear transcript.
 
-`language_directive.txt` ships both defaults. The exact shipped bundle and the
-previous single-language defaults select the corresponding built-in alternative.
-Missing or blank files also use that alternative. Any other file content is a
-custom override and is included verbatim in either mode. Both defaults retain
-user-language matching and natural Chilean Spanish.
+Everything else addressed to a model is English: the chat prefix, spoken
+acknowledgement instruction, delegation results and statuses, omitted-code
+marker, preview instruction and sample, backend persona and chat instructions,
+the voice delegation policy (its filler examples list English and Danish
+phrases), the Codex skip instruction, and tool errors and timeouts. Tools are
+always called with `language: "en"`; the voice model speaks their output in the
+call's language. The desktop UI is English as well. The upstream Spanish strings
+remain in `desktop/plugin.js` as the unused first argument of `tr()`, to keep the
+fork close to upstream.
 
-This change localizes the Spanish model text addressed by PR #4. It does not
-translate the bundled generic English preamble, tool schemas, or existing English
-voice policy; only that policy's changed spoken example follows the flag.
+`language_directive.txt` ships both defaults. The exact shipped bundle, or either
+default on its own, selects the built-in directive for the call's language.
+Missing or blank files do the same. Any other file content is a custom override
+and is included verbatim.
+
 User requests, dynamic tool output, SOUL/persona source text, and memory are not
-translated. Existing voice cleanup and length limits still apply to chat results.
-The Luna behavior is unchanged; neither preview sample adds an owner's name.
+translated. A persona written in another language can still pull the model
+toward it; the directive is a prompt, not a guarantee.
 
 Tests use production function extraction and Node evaluation with transport and
-host stubs. They do not call providers or use a microphone. Existing Codex
-capability fallback can omit prompts when an older server rejects those fields;
-the existing dropped-field report remains in place.
+host stubs, plus the broker boundary tests in `tests/test_codexlive_broker.py`.
+They do not call providers or use a microphone.

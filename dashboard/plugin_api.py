@@ -15,8 +15,10 @@ Routes (mounted at /api/plugins/talk-desktop/):
   GET  /voice/usage         → uso local acumulado de Live Voice (últimos 7 días)
   POST /voice/usage/report  → {durationMs, audioMs} → acumula la sesión al día (lo llama el renderer al colgar)
   POST /tool                → ejecuta una tool de voz (talk_tools) y devuelve texto para hablar
-  POST /codexlive/session   → {profile?, voice?, offer(SDP)} → negocia gpt-live-1-codex (v3) vía codex app-server
-  POST /codexlive/stop      → {threadId} → cierra la sesión realtime de Codex Live
+  POST /codexlive/session   → {profile?, voice?, language?, offer(SDP)} → negocia gpt-live-1-codex (v3) vía
+                              codex app-server; cada llamada tiene su propio thread (threadId = id de la llamada)
+  POST /codexlive/interrupt → {threadId, turnId} → barge-in, solo sobre esa llamada
+  POST /codexlive/stop      → {threadId} → cuelga esa llamada; las demás siguen
 
 El secret efímero va SOLO al renderer del desktop; el OAuth nunca sale del VPS.
 """
@@ -24,6 +26,8 @@ El secret efímero va SOLO al renderer del desktop; el OAuth nunca sale del VPS.
 from __future__ import annotations
 
 import asyncio
+import atexit
+import itertools
 import json
 import logging
 import os
@@ -31,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -138,17 +143,18 @@ def _bot_identity_sections(profile: str) -> dict[str, str]:
 
 
 _DIRECTIVE_PATH = _PLUGIN_ROOT / "language_directive.txt"
+# The voice speaks English or Danish only, never any other language.
 _LANGUAGE_DIRECTIVE_DEFAULT = {
-    "es": (
-        '\n\nIDIOMA Y VOZ: Habla en el idioma en que te habla el usuario — si te habla en español, responde en '
-        'español natural de Chile; si te habla en inglés, en inglés. Nunca mezcles idiomas ni respondas en '
-        'inglés cuando te hablan en español. Tu voz debe sonar como la de un hablante nativo del idioma que '
-        'estés usando.'
-    ),
     "en": (
-        '\n\nLANGUAGE AND VOICE: Speak the language the user speaks to you — if they speak Spanish, reply in '
-        'natural Chilean Spanish; if they speak English, reply in English. Never mix languages or reply in '
-        'English when the user speaks Spanish. Your voice should sound like a native speaker of the language '
+        '\n\nLANGUAGE AND VOICE: Speak English. If the user speaks Danish, reply in natural Danish instead. '
+        'Use only English or Danish: if the user speaks another language, or a transcript looks like one, '
+        'reply in English. Never mix languages. Your voice should sound like a native speaker of the language '
+        'you are using.'
+    ),
+    "da": (
+        '\n\nLANGUAGE AND VOICE: Speak Danish. If the user speaks English, reply in English instead. '
+        'Use only Danish or English: if the user speaks another language, or a transcript looks like one, '
+        'reply in Danish. Never mix languages. Your voice should sound like a native speaker of the language '
         'you are using.'
     ),
 }
@@ -156,8 +162,13 @@ _LANGUAGE_DIRECTIVE_DEFAULT = {
 _LANGUAGE_DIRECTIVE_BUNDLE = "\n\n".join(value.strip() for value in _LANGUAGE_DIRECTIVE_DEFAULT.values())
 
 
-def _language_directive(language: str = "es") -> str:
-    """Select shipped defaults by locale; preserve custom file content verbatim."""
+def _voice_language(value) -> str:
+    """The call's default spoken language: Danish when asked for, otherwise English."""
+    return "da" if str(value or "").strip().lower().startswith("da") else "en"
+
+
+def _language_directive(language: str = "en") -> str:
+    """Select shipped defaults by language; preserve custom file content verbatim."""
     try:
         if _DIRECTIVE_PATH.is_file():
             text = _DIRECTIVE_PATH.read_text(encoding="utf-8")
@@ -167,7 +178,7 @@ def _language_directive(language: str = "es") -> str:
                 return "\n\n" + text
     except OSError:
         pass
-    return _LANGUAGE_DIRECTIVE_DEFAULT["en" if language == "en" else "es"]
+    return _LANGUAGE_DIRECTIVE_DEFAULT[_voice_language(language)]
 
 
 def _resolve_voice(requested: str | None) -> str:
@@ -211,7 +222,7 @@ def _send_to_chat_tool() -> dict:
     }
 
 
-def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language: str = "es"):
+def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language: str | None = "en"):
     """Mint con identity del bot (o del host si no se pide profile)."""
     tools = talk_tools.default_talk_tools()
     if allow_chat:
@@ -229,36 +240,21 @@ def _mint_for(profile: str | None, voice: str, allow_chat: bool = True, language
     instructions = instructions + _language_directive(language)
     if allow_chat:
         instructions += (
-            (
-                "\n\nVOICE + CHAT: The user has a chat open in the app. Answer quick questions and "
-                "small talk directly yourself. When they ask for REAL WORK (doing, creating, reviewing, "
-                "searching their information, or taking action), call send_to_chat with the complete "
-                "request phrased naturally in their language. The system sends it to their open chat, "
-                "where the real agent replies. You will then receive the result; read or summarize it "
-                "aloud naturally in no more than 2-3 sentences. If no chat is open, the tool will tell you."
-            ) if language == "en" else (
-                "\n\nVOZ + CHAT: el usuario tiene un chat abierto en la aplicaci\u00f3n. Para conversaci\u00f3n "
-                "r\u00e1pida, preguntas simples o charla, responde T\u00da directo. Cuando pida TRABAJO REAL "
-                "(hacer, crear, revisar, buscar en sus cosas, actuar sobre algo), llama a send_to_chat con la "
-                "petici\u00f3n completa y natural en su idioma: el sistema la env\u00eda a su chat abierto, el "
-                "agente real responde all\u00ed, y luego recibir\u00e1s el resultado \u2014 l\u00e9elo o "
-                "res\u00famelo en voz alta con naturalidad, m\u00e1ximo 2-3 frases. Si no hay chat abierto, "
-                "la herramienta te lo dir\u00e1."
-            )
+            "\n\nVOICE + CHAT: The user has a chat open in the app. Answer quick questions and "
+            "small talk directly yourself. When they ask for REAL WORK (doing, creating, reviewing, "
+            "searching their information, or taking action), call send_to_chat with the complete "
+            "request phrased naturally in their language. The system sends it to their open chat, "
+            "where the real agent replies. You will then receive the result; read or summarize it "
+            "aloud naturally in no more than 2-3 sentences. If no chat is open, the tool will tell you."
         )
-    instructions += _voice_policy(language)
+    instructions += _VOICE_POLICY
     if profile:
         name = _bot_display_name(profile)
         if "You are Hermes, speaking live" in instructions:
             instructions = instructions.replace("You are Hermes, speaking live", f"You are {name}, speaking live", 1)
         instructions += (
-            (
-                f"\n\nIDENTITY: You are {name}. If asked who you are, "
-                f"answer as {name} in that role — never say you are Hermes, a model, or a generic assistant."
-            ) if language == "en" else (
-                f"\n\nIDENTIDAD: Eres {name}. Si te preguntan quién eres, "
-                f"responde como {name} con su rol — nunca digas que eres Hermes, un modelo, ni un asistente genérico."
-            )
+            f"\n\nIDENTITY: You are {name}. If asked who you are, "
+            f"answer as {name} in that role — never say you are Hermes, a model, or a generic assistant."
         )
     auth = talk_auth.resolve_auth()
     descriptor = talk_wire.mint_ephemeral_session(
@@ -631,30 +627,25 @@ if router is not None:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
-        language = body.get("language")
         name = str(body.get("name") or "").strip()
         arguments = body.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
         if not name:
-            raise HTTPException(status_code=400, detail="name is required" if language == "en" else "name requerido")
+            raise HTTPException(status_code=400, detail="name is required")
         try:
             output = await asyncio.wait_for(
                 asyncio.to_thread(
                     talk_tools.execute_talk_tool, name, arguments,
-                    **({"language": language} if getattr(talk_tools, "SUPPORTS_LANGUAGE", False) else {}),
+                    # Tool output is read by the voice model, which answers in English or Danish.
+                    **({"language": "en"} if getattr(talk_tools, "SUPPORTS_LANGUAGE", False) else {}),
                 ),
                 timeout=110,
             )
         except asyncio.TimeoutError:
             output = (
-                (
-                    f"The tool {name} is still running; I will stop waiting here. "
-                    "Ask me to check the result in a moment."
-                ) if language == "en" else (
-                    f"La herramienta {name} sigue corriendo; no espero más aquí. "
-                    "Pídeme revisar el resultado en un momento."
-                )
+                f"The tool {name} is still running; I will stop waiting here. "
+                "Ask me to check the result in a moment."
             )
         except talk_tools.TalkToolError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -708,57 +699,60 @@ if router is not None:
 
 # ── Codex Live-1 (gpt-live-1-codex, v3/frameless) vía codex app-server ───────
 #
-# El app-server de Codex (>=0.154) negocia una sesión WebRTC contra el backend
-# de ChatGPT usando la suscripción (model_provider=openai). El cliente manda su
-# SDP offer; acá se devuelve el answer. El audio va directo cliente<->OpenAI.
+# El app-server de Codex negocia una sesión WebRTC contra el backend de ChatGPT
+# usando la suscripción (model_provider=openai). El cliente manda su SDP offer;
+# acá se devuelve el answer. El audio va directo cliente<->OpenAI.
+#
+# Call ownership: one long-lived app-server process serves every call, and each
+# call owns a fresh ephemeral thread. Responses are correlated by request id and
+# notifications by threadId, so SDP, errors, closes and stops only ever reach
+# their own call; a call that is not registered (never started, failed, stopped)
+# receives nothing. Nothing is cached between calls, so each call starts with
+# fresh voice context.
+#
+# Execution guard: with clientManagedHandoffs the realtime core still opens a
+# Codex turn on the backing thread for every delegation (observed on 0.160.0).
+# Tasks must run in the client's Hermes chat only, so the backing thread is
+# created without environment access, read-only, network-less and with every
+# approval routed to this broker, which declines it; any backing turn is
+# interrupted the moment it starts, and any execution item interrupts it again.
 
-_CL: dict = {"proc": None, "notifs": [], "seq": 0, "thread_id": None}
-_CL_LOCK = threading.Lock()
+# Validated against codex-cli 0.160.0 (see docs/live-voice-recipe.md). Older
+# app-servers either lack the thread restrictions below or silently ignore them.
+_CODEX_MIN_VERSION = (0, 160, 0)
+_LIVE_START_TIMEOUT_S = 20.0
+_LIVE_RPC_TIMEOUT_S = 25.0
+# Features that give the backing Codex thread tools; the voice lane needs none.
+_LIVE_DISABLED_FEATURES = (
+    "apps", "plugins", "shell_tool", "unified_exec", "browser_use", "computer_use",
+    "image_generation", "multi_agent", "view_image", "hooks",
+)
+_EXECUTION_ITEMS = frozenset({
+    "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall",
+    "subAgentActivity", "webSearch", "imageView", "imageGeneration",
+})
+_SERVER_REQUEST_DECLINES = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "execCommandApproval": {"decision": "denied"},
+    "applyPatchApproval": {"decision": "denied"},
+    "mcpServer/elicitation/request": {"action": "decline"},
+}
 
 
-def _cl_send(obj: dict) -> None:
-    proc = _CL["proc"]
-    if proc is None or proc.poll() is not None:
-        raise RuntimeError("codex app-server no disponible")
-    proc.stdin.write(json.dumps(obj) + "\n")
-    proc.stdin.flush()
+class LiveCallError(RuntimeError):
+    """A call could not start; `code` tells the client why without parsing prose."""
 
-
-def _cl_reader(proc) -> None:
-    try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                _CL["notifs"].append(json.loads(line))
-            except Exception:  # noqa: BLE001
-                continue
-            if len(_CL["notifs"]) > 6000:
-                del _CL["notifs"][:2000]
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _cl_request(method: str, params: dict, timeout: float = 30.0):
-    _CL["seq"] += 1
-    rid = _CL["seq"]
-    _cl_send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        # Escanear por id: el pruner de _cl_reader borra el inicio del buffer, así
-        # que una posición `start` puede quedar stale y perder la respuesta.
-        for m in list(_CL["notifs"]):
-            if m.get("id") == rid:
-                if "error" in m:
-                    raise RuntimeError(str(m["error"].get("message") or m["error"])[:400])
-                return m.get("result")
-        time.sleep(0.1)
-    raise TimeoutError(f"codex app-server: {method} sin respuesta")
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 def _codex_binary() -> str | None:
     """Resuelve el binario de codex aunque el PATH del servicio no traiga ~/.npm-global/bin."""
+    configured = os.environ.get("TALK_CODEX_BINARY", "").strip()
+    if configured:
+        return configured
     try:
         found = shutil.which("codex")
     except Exception:  # noqa: BLE001
@@ -780,35 +774,372 @@ def _codex_binary() -> str | None:
     return None
 
 
-def _cl_ensure() -> None:
-    proc = _CL["proc"]
-    if proc is not None and proc.poll() is None:
-        return
-    binary = _codex_binary()
-    if not binary:
-        raise RuntimeError("codex no encontrado (PATH del servicio sin ~/.npm-global/bin)")
-    env = os.environ.copy()
-    env["PATH"] = (str(Path.home() / ".npm-global" / "bin") + ":" + env.get("PATH", "")).strip(":")
-    # clave: la lane de voz usa la SUSCRIPCIÓN (auth.json), no una API key de entorno
-    env.pop("OPENAI_API_KEY", None)
-    env.pop("CODEX_API_KEY", None)
-    proc = subprocess.Popen(
-        [binary, "app-server", "--listen", "stdio://",
-         "--enable", "realtime_conversation",
-         "-c", "model_provider=openai",
-         "-c", "suppress_unstable_features_warning=true"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, bufsize=1, env=env,
-    )
-    _CL["proc"] = proc
-    _CL["notifs"] = []
-    _CL["thread_id"] = None
-    threading.Thread(target=_cl_reader, args=(proc,), daemon=True).start()
-    _cl_request("initialize", {"clientInfo": {"name": "hermes-talk-desktop", "version": "1.0"},
-                               "capabilities": {"experimentalApi": True}}, timeout=25)
+def _codex_version(user_agent: str) -> tuple[int, int, int] | None:
+    m = re.search(r"/(\d+)\.(\d+)\.(\d+)", user_agent or "")
+    return tuple(int(part) for part in m.groups()) if m else None
 
 
-def _codexlive_persona(profile: str | None, language: str = "es") -> str:
+class _AppServer:
+    """One `codex app-server` process speaking JSON-RPC over stdio."""
+
+    def __init__(self, on_notification, on_exit):
+        self._on_notification = on_notification
+        self._on_exit = on_exit
+        self._proc = None
+        self._ids = itertools.count(1)
+        self._pending: dict[int, dict] = {}
+        self._pending_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self.version: tuple[int, int, int] | None = None
+        # The backing threads' working directory: empty and private.
+        self.cwd = tempfile.mkdtemp(prefix="talk-desktop-live-")
+
+    def start(self) -> None:
+        binary = _codex_binary()
+        if not binary:
+            raise LiveCallError("LIVE_UNAVAILABLE", "codex not found (the service PATH may lack ~/.npm-global/bin; set TALK_CODEX_BINARY)")
+        env = os.environ.copy()
+        env["PATH"] = (str(Path.home() / ".npm-global" / "bin") + ":" + env.get("PATH", "")).strip(":")
+        # clave: la lane de voz usa la SUSCRIPCIÓN (auth.json), no una API key de entorno
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("CODEX_API_KEY", None)
+        argv = [binary, "app-server", "--listen", "stdio://", "--enable", "realtime_conversation"]
+        for feature in _LIVE_DISABLED_FEATURES:
+            argv += ["--disable", feature]
+        argv += ["-c", "model_provider=openai", "-c", 'web_search="disabled"',
+                 "-c", "suppress_unstable_features_warning=true"]
+        self._proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, env=env, cwd=self.cwd,
+        )
+        threading.Thread(target=self._read, args=(self._proc,), daemon=True).start()
+        result = self.request("initialize", {"clientInfo": {"name": "hermes-talk-desktop", "version": "1.0"},
+                                             "capabilities": {"experimentalApi": True}})
+        self.version = _codex_version(str((result or {}).get("userAgent") or ""))
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def close(self) -> None:
+        if self._proc is not None:
+            _terminate(self._proc)
+        shutil.rmtree(self.cwd, ignore_errors=True)
+
+    def _write(self, obj: dict) -> None:
+        if not self.alive():
+            raise RuntimeError("codex app-server is not running")
+        with self._write_lock:
+            self._proc.stdin.write(json.dumps(obj) + "\n")
+            self._proc.stdin.flush()
+
+    def request(self, method: str, params: dict, timeout: float = _LIVE_RPC_TIMEOUT_S):
+        rid = next(self._ids)
+        slot = {"done": threading.Event(), "msg": None}
+        with self._pending_lock:
+            self._pending[rid] = slot
+        try:
+            self._write({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+            if not slot["done"].wait(max(0.0, timeout)):
+                raise TimeoutError(f"codex app-server: no response to {method}")
+        finally:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+        msg = slot["msg"]
+        if msg is None:
+            raise RuntimeError("codex app-server exited")
+        if "error" in msg:
+            err = msg["error"]
+            raise RuntimeError(str(err.get("message") if isinstance(err, dict) else err)[:400])
+        return msg.get("result")
+
+    def send(self, method: str, params: dict) -> None:
+        """Fire a request whose response nobody waits for (safe from the reader thread)."""
+        try:
+            self._write({"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params})
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _read(self, proc) -> None:
+        try:
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if "method" in msg and "id" in msg:
+                    self._answer_server_request(msg)
+                elif "id" in msg:
+                    with self._pending_lock:
+                        slot = self._pending.get(msg["id"])
+                    if slot is not None:
+                        slot["msg"] = msg
+                        slot["done"].set()
+                elif "method" in msg:
+                    try:
+                        self._on_notification(self, msg)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("codex live: notification handler failed")
+        except Exception:  # noqa: BLE001
+            pass
+        with self._pending_lock:
+            for slot in self._pending.values():
+                slot["done"].set()
+        self._on_exit(self)
+
+    def _answer_server_request(self, msg: dict) -> None:
+        # The broker is the only client of this app-server, so it is the
+        # approver: nothing the backing thread asks for is ever granted.
+        method = msg.get("method")
+        _log.warning("codex live: declined backing-thread request %s", method)
+        decline = _SERVER_REQUEST_DECLINES.get(method)
+        try:
+            if decline is not None:
+                self._write({"jsonrpc": "2.0", "id": msg["id"], "result": decline})
+            else:
+                self._write({"jsonrpc": "2.0", "id": msg["id"],
+                             "error": {"code": -32601, "message": "not available to the voice lane"}})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _LiveCall:
+    def __init__(self, thread_id: str, server: _AppServer):
+        self.thread_id = thread_id
+        self.server = server
+        self.answer: str | None = None
+        self.session_id: str | None = None
+        self.error: str | None = None
+        self.closed: str | None = None
+        self.settled = threading.Event()
+
+
+class _LiveBroker:
+    """Call-scoped broker: every call owns its thread; nothing is shared between calls."""
+
+    def __init__(self):
+        self._server: _AppServer | None = None
+        self._spawn_lock = threading.Lock()
+        self._calls: dict[str, _LiveCall] = {}
+        # Ended calls stay guarded (their backing turns are still interrupted)
+        # but receive nothing else.
+        self._retired: dict[str, _AppServer] = {}
+        self._lock = threading.Lock()
+
+    def _ensure_server(self) -> _AppServer:
+        with self._spawn_lock:
+            server = self._server
+            if server is not None and server.alive():
+                return server
+            server = _AppServer(self._route, self._server_exited)
+            try:
+                server.start()
+            except LiveCallError:
+                server.close()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                server.close()
+                raise LiveCallError("LIVE_UNAVAILABLE", f"codex app-server did not start: {exc}") from exc
+            if server.version is None or server.version < _CODEX_MIN_VERSION:
+                found = ".".join(map(str, server.version)) if server.version else "unknown"
+                server.close()
+                raise LiveCallError(
+                    "LIVE_UNSUPPORTED",
+                    f"codex {found} cannot enforce the voice thread restrictions; "
+                    + ".".join(map(str, _CODEX_MIN_VERSION)) + " or newer is required",
+                )
+            self._server = server
+            return server
+
+    def _route(self, server: _AppServer, msg: dict) -> None:
+        method = msg.get("method") or ""
+        params = msg.get("params") or {}
+        tid = params.get("threadId")
+        if not tid:
+            return
+        with self._lock:
+            call = self._calls.get(tid)
+            guarded = call is not None or self._retired.get(tid) is server
+        if guarded and method in ("turn/started", "item/started", "turn/completed"):
+            turn = params.get("turn") or {}
+            if method == "turn/completed":
+                level = logging.INFO if turn.get("status") == "interrupted" and not turn.get("items") else logging.WARNING
+                _log.log(level, "codex live: backing turn %s ended %s with %d items",
+                         turn.get("id"), turn.get("status"), len(turn.get("items") or []))
+                return
+            item_type = (params.get("item") or {}).get("type")
+            if method == "turn/started" or item_type in _EXECUTION_ITEMS:
+                if method == "item/started":
+                    _log.warning("codex live: backing thread started %s; interrupting", item_type)
+                turn_id = turn.get("id") if method == "turn/started" else params.get("turnId")
+                if turn_id:
+                    # Off the reader thread: the response arrives through it.
+                    threading.Thread(target=self._interrupt_backing, args=(server, tid, turn_id), daemon=True).start()
+            return
+        if call is None or call.server is not server:
+            return
+        if method == "thread/realtime/sdp":
+            call.answer = params.get("sdp") or call.answer
+            call.settled.set()
+        elif method == "thread/realtime/started":
+            call.session_id = params.get("realtimeSessionId") or call.session_id
+        elif method == "thread/realtime/error":
+            call.error = str(params.get("message") or "error")[:300]
+            call.settled.set()
+        elif method == "thread/realtime/closed":
+            call.closed = str(params.get("reason") or "closed")
+            _log.info("codex live: call %s closed by the service (%s)", tid, call.closed)
+            self._forget(call)
+            call.settled.set()
+
+    @staticmethod
+    def _interrupt_backing(server: _AppServer, thread_id: str, turn_id: str) -> None:
+        _log.info("codex live: interrupting backing turn %s", turn_id)
+        try:
+            server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=8)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("codex live: could not interrupt backing turn %s: %s", turn_id, exc)
+
+    def _server_exited(self, server: _AppServer) -> None:
+        with self._lock:
+            dead = [c for c in self._calls.values() if c.server is server]
+            for call in dead:
+                self._calls.pop(call.thread_id, None)
+            for tid in [t for t, s in self._retired.items() if s is server]:
+                self._retired.pop(tid, None)
+        for call in dead:
+            call.error = call.error or "codex app-server exited"
+            call.settled.set()
+
+    def _forget(self, call: _LiveCall) -> bool:
+        with self._lock:
+            if self._calls.get(call.thread_id) is not call:
+                return False
+            del self._calls[call.thread_id]
+            self._retired[call.thread_id] = call.server
+            while len(self._retired) > 256:
+                self._retired.pop(next(iter(self._retired)))
+            return True
+
+    def _end(self, call: _LiveCall) -> bool:
+        if not self._forget(call):
+            return False
+        try:
+            call.server.request("thread/realtime/stop", {"threadId": call.thread_id}, timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    def start_call(self, *, persona: str, start_instructions: str, voice: str, offer: str,
+                   model: str | None) -> dict:
+        deadline = time.monotonic() + _LIVE_START_TIMEOUT_S
+
+        def remaining() -> float:
+            return max(0.1, deadline - time.monotonic())
+
+        server = self._ensure_server()
+        body = {
+            "cwd": server.cwd, "modelProvider": "openai", "ephemeral": True,
+            "environments": [], "sandbox": "read-only", "approvalPolicy": "untrusted",
+        }
+        if model:
+            body["model"] = model
+        try:
+            started = server.request("thread/start", body, timeout=remaining()) or {}
+        except TimeoutError as exc:
+            raise LiveCallError("LIVE_TIMEOUT", str(exc)) from exc
+        except RuntimeError as exc:
+            raise LiveCallError("LIVE_START_FAILED", str(exc)) from exc
+        thread = started.get("thread") or {}
+        tid = thread.get("id")
+        if not tid:
+            raise LiveCallError("LIVE_START_FAILED", "codex did not create a thread")
+        call = _LiveCall(tid, server)
+        with self._lock:
+            self._calls[tid] = call
+        try:
+            # Verify the restrictions took effect rather than trusting the request.
+            sandbox = started.get("sandbox") or {}
+            if not (thread.get("ephemeral") is True and thread.get("environments") == []
+                    and sandbox.get("type") == "readOnly" and not sandbox.get("networkAccess")
+                    and started.get("approvalPolicy") == "untrusted"):
+                raise LiveCallError("LIVE_UNSAFE", "the app-server did not apply the voice thread restrictions")
+            params = {
+                "threadId": tid,
+                "transport": {"type": "webrtc", "sdp": offer},
+                "outputModality": "audio",
+                "version": "v3",
+                "voice": voice or "cove",
+                "prompt": persona,
+                "realtimeStartInstructions": start_instructions,
+                # Delegated tasks run in the client's Hermes chat; the backing
+                # thread is never an executor (see the execution guard above).
+                "clientManagedHandoffs": True,
+                "delegationAckFiller": True,
+            }
+            try:
+                server.request("thread/realtime/start", params, timeout=remaining())
+            except TimeoutError as exc:
+                raise LiveCallError("LIVE_TIMEOUT", str(exc)) from exc
+            except RuntimeError as exc:
+                low = str(exc).lower()
+                if "usage limit" in low or "hit your usage" in low:
+                    raise LiveCallError(
+                        "LIVE_SIN_QUOTA",
+                        "the ChatGPT plan reached its limit (Live Voice shares that allowance). "
+                        "Switch the voice engine to gpt-realtime-2.1 in the settings, or wait for the reset.",
+                    ) from exc
+                if "unknown field" in low or "unknown variant" in low:
+                    raise LiveCallError("LIVE_UNSUPPORTED", f"the app-server rejected the voice session: {exc}") from exc
+                raise LiveCallError("LIVE_START_FAILED", str(exc)) from exc
+            if not call.settled.wait(remaining()):
+                raise LiveCallError("LIVE_TIMEOUT", "codex live: no SDP answer")
+            if call.error:
+                raise LiveCallError("LIVE_START_FAILED", "codex live: " + call.error)
+            if not call.answer:
+                raise LiveCallError("LIVE_START_FAILED", f"codex live: session closed ({call.closed or 'no SDP answer'})")
+        except BaseException:
+            self._end(call)
+            raise
+        return {
+            "answer": call.answer,
+            "realtimeSessionId": call.session_id,
+            "threadId": tid,
+            "version": "v3",
+            "engine": "codex",
+            "handoff": "client",
+            "codexVersion": ".".join(map(str, server.version)),
+        }
+
+    def stop_call(self, thread_id: str) -> bool:
+        with self._lock:
+            call = self._calls.get(thread_id)
+        if call is None or not self._end(call):
+            return False
+        _log.info("codex live: call %s stopped", thread_id)
+        return True
+
+    def interrupt(self, thread_id: str, turn_id: str) -> bool:
+        with self._lock:
+            call = self._calls.get(thread_id)
+        if call is None:
+            return False
+        call.server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=8)
+        return True
+
+    def close(self) -> None:
+        with self._spawn_lock:
+            server, self._server = self._server, None
+        if server is not None:
+            server.close()
+
+
+_LIVE = _LiveBroker()
+atexit.register(_LIVE.close)
+
+
+def _codexlive_persona(profile: str | None, language: str | None = "en") -> str:
     if profile:
         sections = _bot_identity_sections(profile)
         name = _bot_display_name(profile)
@@ -820,61 +1151,32 @@ def _codexlive_persona(profile: str | None, language: str = "es") -> str:
         base = base.replace("You are Hermes, speaking live", f"You are {name}, speaking live", 1)
     base += _language_directive(language)
     base += (
-        (
-            f"\n\nVOICE: You are speaking with the user in a live voice session. Keep replies brief, natural, and to the point."
-            f" IDENTITY: You are {name}; if asked who you are, answer as {name} in that role — never as a generic assistant."
-        ) if language == "en" else (
-            f"\n\nVOZ: hablas con el usuario en una sesión de voz en vivo. Respuestas breves, naturales y al grano."
-            f" IDENTIDAD: eres {name}; si te preguntan quién eres, responde como {name} con su rol — nunca como un asistente genérico."
-        )
+        f"\n\nVOICE: You are speaking with the user in a live voice session. Keep replies brief, natural, and to the point."
+        f" IDENTITY: You are {name}; if asked who you are, answer as {name} in that role — never as a generic assistant."
     )
-    base += _voice_policy(language)
+    base += _VOICE_POLICY
     return base
 
 
-_AGENT_INSTR = {
-    "es": (
-        'Estás conectado a una sesión de voz en vivo con el usuario. Cuando la sesión de voz te delegue una '
-        'petición, actúala con tus herramientas y responde conciso: tu texto se leerá en voz alta.'
-    ),
-    "en": (
-        'You are connected to a live voice session with the user. When the voice session delegates a request '
-        'to you, carry it out with your tools and reply concisely: your text will be read aloud.'
-    ),
-}
-
-# Modo cliente (default): el CLIENTE ejecuta lo que la voz pide (chat de Hermes del usuario).
-# El core igual rutea cada delegación a este thread como fallback fantasma — si el agente
-# hiciera trabajo aquí (tool calls, gpt-5.6-sol), quemaría el plan ChatGPT y duplicaría todo.
-# Esta instrucción lo neutraliza: responder 'skip' sin usar herramientas.
-_AGENT_INSTR_SKIP = {
-    "es": (
-        'Estás conectado a una sesión de voz en vivo, pero es el CLIENTE (la app) quien ejecuta las '
-        'peticiones de esa sesión. Si recibes un mensaje <realtime_delegation>, NO ejecutes nada, NO uses '
-        'herramientas y NO leas archivos: responde únicamente la palabra: skip'
-    ),
-    "en": (
-        'You are connected to a live voice session, but the CLIENT (the app) executes the requests from that '
-        'session. If you receive a <realtime_delegation> message, do NOT execute anything, do NOT use tools, '
-        'and do NOT read files: reply with only the word: skip'
-    ),
-}
+# El CLIENTE ejecuta lo que la voz pide (chat de Hermes del usuario). El core igual
+# rutea cada delegación al thread de respaldo; el broker interrumpe ese turno al
+# empezar (ver el execution guard). Esta instrucción es solo una capa extra.
+_AGENT_INSTR_SKIP = (
+    'You are connected to a live voice session, but the CLIENT (the app) executes the requests from that '
+    'session. If you receive a <realtime_delegation> message, do NOT execute anything, do NOT use tools, '
+    'and do NOT read files: reply with only the word: skip'
+)
 
 # Política de delegación para el MODELO DE VOZ (el que decide qué pasa al backend).
-# Sin esto delega cualquier cosa (saludos, fragmentos, "aló") y satura el chat con turnos largos.
+# Sin esto delega cualquier cosa (saludos, fragmentos, "hello?") y satura el chat con turnos largos.
 _VOICE_POLICY = (
     "\n\nVOICE DELEGATION POLICY (live call):\n"
     "- Delegate to the chat/backend ONLY when the user asks you to DO something (check, review, find, run, make, fix, send, remember) or when answering needs real facts/actions from the backend.\n"
-    "- Do NOT delegate greetings, small talk, acknowledgements, filler, thinking out loud, fragments, or repeats of something already answered (e.g. 'dale', 'ok', 'ya', 'bueno', '¿aló?', '¿me escuchas?'). Answer those yourself, briefly, or stay quiet.\n"
+    "- Do NOT delegate greetings, small talk, acknowledgements, filler, thinking out loud, fragments, or repeats of something already answered (e.g. 'ok', 'yeah', 'right', 'hello?', 'can you hear me?', 'ja', 'okay', 'nå', 'hallo?', 'kan du høre mig?'). Answer those yourself, briefly, or stay quiet.\n"
     "- If the request is unclear, ask ONE short clarifying question yourself instead of delegating.\n"
-    "- While a task is running: say ONE brief line in the user's language ('sure, I will check') and WAIT silently; do not guess results, do not delegate again in the meantime; if the user speaks, tell them you are still on it.\n"
+    "- While a task is running: say ONE brief line in the user's language ('sure, I will check' / 'ja, jeg tjekker det') and WAIT silently; do not guess results, do not delegate again in the meantime; if the user speaks, tell them you are still on it.\n"
     "- When the result arrives, read the key facts back in one or two short sentences."
 )
-
-
-def _voice_policy(language: str = "es") -> str:
-    # The shared English policy is outside localization scope; localize its example.
-    return _VOICE_POLICY if language == "en" else _VOICE_POLICY.replace("sure, I will check", "dale, lo reviso")
 
 
 def _talk_settings() -> dict:
@@ -890,131 +1192,27 @@ def _talk_settings() -> dict:
 
 
 def _agent_model() -> str | None:
-    """Modelo del agente delegado (el thread de Codex que ejecuta tareas de voz).
-    En cajas con un modelo default no-ChatGPT (p.ej. un proxy) hay que forzar un
-    modelo oficial; si no, el turno del agente falla con 400."""
+    """Modelo del thread de respaldo. En cajas con un modelo default no-ChatGPT
+    (p.ej. un proxy) hay que forzar un modelo oficial; si no, thread/start falla."""
     v = os.environ.get("TALK_CODEX_AGENT_MODEL") or str(_talk_settings().get("codexAgentModel") or "")
     v = v.strip()
     return v or None
 
 
-def _cl_thread_ensure(language: str = "es") -> str:
-    language = "en" if language == "en" else "es"
-    want = _agent_model()
-    tid = _CL.get("thread_id")
-    if tid and _CL.get("thread_model") == want and _CL.get("thread_language") == language:
-        return tid
-    body = {"cwd": str(Path.home()), "modelProvider": "openai"}
-    if want:
-        body["model"] = want
-    th = _cl_request("thread/start", body, timeout=30)
-    tid = ((th or {}).get("thread") or {}).get("id")
-    if not tid:
-        raise RuntimeError("codex: no se pudo crear el thread")
-    _CL["thread_id"] = tid
-    _CL["thread_model"] = want
-    _CL["thread_language"] = language
-    return tid
-
-
-def _codexlive_start(profile: str | None, voice: str, offer: str, language: str = "es") -> dict:
-    _cl_ensure()
-    tid = _cl_thread_ensure(language)
-    persona = _codexlive_persona(profile, language)
-    client_managed = str(_talk_settings().get("delegation") or "client").strip().lower() != "server"
-    params = {
-        "threadId": tid,
-        "transport": {"type": "webrtc", "sdp": offer},
-        "outputModality": "audio",
-        "version": "v3",
-        "voice": voice or "cove",
-        "prompt": persona,
-        "realtimeStartInstructions": (_AGENT_INSTR if not client_managed else _AGENT_INSTR_SKIP)["en" if language == "en" else "es"],
-        # Gestión de tareas delegadas por voz: POR DEFECTO el CLIENTE (el desktop) las
-        # ejecuta en el chat de Hermes del usuario — usa SU configuración/modelos/providers.
-        # Solo si settings.json lleva {"delegation": "server"} se deja que el core las
-        # mande al agente Codex del thread (lane ChatGPT). ackFiller = frases de espera.
-        "clientManagedHandoffs": client_managed,
-        "delegationAckFiller": True,
-    }
-    drop_groups = (("delegationAckFiller",), ("clientManagedHandoffs",), ("realtimeStartInstructions", "prompt"))
-    dropped: list[str] = []
-    start = len(_CL["notifs"])
-    gi = 0
-    while True:
-        try:
-            _cl_request("thread/realtime/start", params, timeout=25)
-            break
-        except RuntimeError as exc:
-            low = str(exc).lower()
-            if "unknown field" in low and gi < len(drop_groups):
-                for f in drop_groups[gi]:
-                    if f in params:
-                        params.pop(f)
-                        dropped.append(f)
-                gi += 1
-                start = len(_CL["notifs"])
-                continue
-            if "thread" in low and ("not found" in low or "no such" in low or "not loaded" in low or "missing" in low):
-                # thread obsoleto: recrear y reintentar una vez
-                _CL["thread_id"] = None
-                _CL["thread_model"] = None
-                tid2 = _cl_thread_ensure(language)
-                params["threadId"] = tid2
-                start = len(_CL["notifs"])
-                _cl_request("thread/realtime/start", params, timeout=25)
-                break
-            if "usage limit" in low or "hit your usage" in low:
-                raise RuntimeError(
-                    "LIVE_SIN_QUOTA: el plan ChatGPT llegó a su límite semanal (Live Voice comparte esa cuota). "
-                    "Cambia el Motor de voz a gpt-realtime-2.1 en la configuración, o espera el reset semanal."
-                )
-            if "already" in low:
-                # sesión realtime colgada en el thread: cerrarla y reintentar
-                try:
-                    _cl_request("thread/realtime/stop", {"threadId": params.get("threadId")}, timeout=10)
-                except Exception:  # noqa: BLE001
-                    pass
-                start = len(_CL["notifs"])
-                _cl_request("thread/realtime/start", params, timeout=25)
-                break
-            raise
-    answer = None
-    rsid = None
-    t0 = time.time()
-    while time.time() - t0 < 45:
-        for m in list(_CL["notifs"])[start:]:
-            meth = m.get("method") or ""
-            if meth == "thread/realtime/sdp":
-                answer = (m.get("params") or {}).get("sdp") or answer
-            elif meth == "thread/realtime/started":
-                rsid = (m.get("params") or {}).get("realtimeSessionId") or rsid
-            elif meth == "thread/realtime/error":
-                raise RuntimeError("codex live: " + str((m.get("params") or {}).get("message"))[:300])
-        if answer:
-            break
-        time.sleep(0.15)
-    if not answer:
-        raise TimeoutError("codex live: sin SDP de respuesta")
-    result = {"answer": answer, "realtimeSessionId": rsid, "threadId": params.get("threadId") or tid, "version": "v3", "engine": "codex",
-              "handoff": "client" if client_managed else "server"}
-    if dropped:
-        _log.warning("codex live: app-server no soporta %s (se omitieron)", ", ".join(dropped))
-        result["droppedFields"] = dropped
-        if "clientManagedHandoffs" in dropped and client_managed:
-            result["handoffDegraded"] = True
-            result["warning"] = ("el app-server no soporta clientManagedHandoffs: las delegaciones de voz pueden ejecutarse "
-                                 "en el hilo del agente (lane ChatGPT) en vez del chat del cliente")
-    return result
-
-
-def _codexlive_stop(thread_id: str | None) -> None:
-    if not thread_id:
-        return
-    try:
-        _cl_request("thread/realtime/stop", {"threadId": thread_id}, timeout=10)
-    except Exception:  # noqa: BLE001
-        pass
+def _codexlive_start(profile: str | None, voice: str, offer: str, language: str | None = "en") -> dict:
+    if str(_talk_settings().get("delegation") or "client").strip().lower() == "server":
+        raise LiveCallError(
+            "LIVE_UNSUPPORTED",
+            'settings.json asks for {"delegation": "server"}, but this broker never runs tasks on the Codex '
+            "thread: voice tasks run in the Hermes chat. Remove that setting.",
+        )
+    return _LIVE.start_call(
+        persona=_codexlive_persona(profile, language),
+        start_instructions=_AGENT_INSTR_SKIP,
+        voice=voice,
+        offer=offer,
+        model=_agent_model(),
+    )
 
 
 if router is not None:
@@ -1027,20 +1225,19 @@ if router is not None:
             body = {}
         profile = str(body.get("profile") or "").strip() or None
         if profile and _profile_home(profile) is None:
-            raise HTTPException(status_code=400, detail=f"perfil '{profile}' no existe")
+            raise HTTPException(status_code=400, detail=f"profile '{profile}' does not exist")
         voice = str(body.get("voice") or "cove")
         offer = str(body.get("offer") or "")
         if not offer:
-            raise HTTPException(status_code=400, detail="falta el SDP offer")
-
-        def _do():
-            with _CL_LOCK:
-                return _codexlive_start(profile, voice, offer, body.get("language"))
-
+            raise HTTPException(status_code=400, detail="the SDP offer is missing")
         try:
-            result = await asyncio.to_thread(_do)
+            result = await asyncio.to_thread(_codexlive_start, profile, voice, offer, body.get("language"))
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=str(exc)[:400]) from exc
+        if await request.is_disconnected():
+            # Nobody will apply this answer: do not leave an orphan realtime session.
+            await asyncio.to_thread(_LIVE.stop_call, result["threadId"])
+            raise HTTPException(status_code=499, detail="the client closed the connection")
         return {
             "ok": True,
             "engine": "codex",
@@ -1058,13 +1255,12 @@ if router is not None:
         except Exception:  # noqa: BLE001
             body = {}
         turn_id = str(body.get("turnId") or "").strip()
-        thread_id = str(body.get("threadId") or "").strip() or _CL.get("thread_id")
+        thread_id = str(body.get("threadId") or "").strip()
         if not turn_id or not thread_id:
-            return {"ok": False, "error": "faltan turnId/threadId"}
+            return {"ok": False, "error": "turnId and threadId are required"}
         try:
-            await asyncio.to_thread(
-                _cl_request, "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=8
-            )
+            if not await asyncio.to_thread(_LIVE.interrupt, thread_id, turn_id):
+                return {"ok": False, "error": "no such active call"}
             return {"ok": True}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)[:200]}
@@ -1076,7 +1272,7 @@ if router is not None:
             body = await request.json()
         except Exception:  # noqa: BLE001
             body = {}
-        tid = str(body.get("threadId") or _CL.get("thread_id") or "")
-        await asyncio.to_thread(_codexlive_stop, tid)
-        return {"ok": True}
-
+        tid = str(body.get("threadId") or "").strip()
+        if not tid:
+            return {"ok": False, "error": "threadId is required"}
+        return {"ok": True, "stopped": await asyncio.to_thread(_LIVE.stop_call, tid)}

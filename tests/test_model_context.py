@@ -11,7 +11,7 @@ from test_plugin_api import PLUGIN_API, REPO, VENDOR, load_unit
 
 
 @pytest.mark.parametrize('localized', [False, True])
-@pytest.mark.parametrize('language', ['en', 'es'])
+@pytest.mark.parametrize('language', ['en', 'da', 'es'])
 def test_tool_adapter_signature_compatibility(localized, language):
     ns = load_unit(PLUGIN_API, 'run_tool')
     calls = []
@@ -20,7 +20,7 @@ def test_tool_adapter_signature_compatibility(localized, language):
         calls.append((name, arguments))
         return 'Original tool output'
 
-    def localized_tool(name, arguments, language='es'):
+    def localized_tool(name, arguments, language='en'):
         calls.append((name, arguments, language))
         return 'Original tool output'
 
@@ -35,19 +35,18 @@ def test_tool_adapter_signature_compatibility(localized, language):
             return {'name': 'example', 'arguments': {}, 'language': language}
 
     assert asyncio.run(ns['run_tool'](Request()))['output'] == 'Original tool output'
-    assert calls == [('example', {}, language) if localized else ('example', {})]
+    # Tool output is read by the voice model, so tools always answer in English.
+    assert calls == [('example', {}, 'en') if localized else ('example', {})]
 
 
 def constants():
     tree = ast.parse(PLUGIN_API.read_text())
-    names = {'_LANGUAGE_DIRECTIVE_DEFAULT', '_AGENT_INSTR', '_AGENT_INSTR_SKIP', '_VOICE_POLICY'}
+    names = {'_LANGUAGE_DIRECTIVE_DEFAULT', '_AGENT_INSTR_SKIP', '_VOICE_POLICY'}
     result = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
             if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
             and n.targets[0].id in names}
     result['_LANGUAGE_DIRECTIVE_BUNDLE'] = '\n\n'.join(v.strip() for v in result['_LANGUAGE_DIRECTIVE_DEFAULT'].values())
-    policy = load_unit(PLUGIN_API, '_voice_policy')
-    policy.update(result)
-    result['_voice_policy'] = policy['_voice_policy']
+    result['_voice_language'] = load_unit(PLUGIN_API, '_voice_language')['_voice_language']
     return result
 
 
@@ -58,29 +57,30 @@ def vendor_module(name):
     return module
 
 
-@pytest.mark.parametrize('language', ['es', 'en'])
-def test_language_directive_default_file_and_user_override(tmp_path, language):
+@pytest.mark.parametrize('language, spoken', [('en', 'English'), ('da', 'Danish'), ('es', 'English'), (None, 'English')])
+def test_language_directive_default_file_and_user_override(tmp_path, language, spoken):
     ns = load_unit(PLUGIN_API, '_language_directive')
     ns.update(constants(), _DIRECTIVE_PATH=REPO / 'language_directive.txt')
     expected = ns['_language_directive'](language)
-    assert expected == ns['_LANGUAGE_DIRECTIVE_DEFAULT'][language]
-    assert ('natural Chilean Spanish' if language == 'en' else 'español natural de Chile') in expected
-    assert ('if they speak English, reply in English' if language == 'en' else 'si te habla en inglés, en inglés') in expected
+    assert expected == ns['_LANGUAGE_DIRECTIVE_DEFAULT']['da' if spoken == 'Danish' else 'en']
+    assert f'Speak {spoken}.' in expected
+    assert 'Use only English or Danish' in expected or 'Use only Danish or English' in expected
+    assert 'Spanish' not in expected
     ns['_DIRECTIVE_PATH'] = tmp_path / 'directive.txt'
     assert ns['_language_directive'](language) == expected
     ns['_DIRECTIVE_PATH'].write_text('')
     assert ns['_language_directive'](language) == expected
-    custom = '  Mi preferencia personal: español.\n'
+    custom = '  Min personlige præference: dansk.\n'
     ns['_DIRECTIVE_PATH'].write_text(custom)
     assert ns['_language_directive'](language) == '\n\n' + custom
-    for legacy_default in ns['_LANGUAGE_DIRECTIVE_DEFAULT'].values():
-        ns['_DIRECTIVE_PATH'].write_text(legacy_default.strip() + '\n')
+    for shipped in ns['_LANGUAGE_DIRECTIVE_DEFAULT'].values():
+        ns['_DIRECTIVE_PATH'].write_text(shipped.strip() + '\n')
         assert ns['_language_directive'](language) == expected
 
 
 @pytest.mark.parametrize('profile', [None, 'example-bot'])
 @pytest.mark.parametrize('allow_chat', [False, True])
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'da'])
 def test_constructed_voice_prompts(profile, allow_chat, language):
     sections = {'PERSONA': 'Soy un bot de prueba.', 'MEMORY': 'El usuario vive en Chile.'}
     ns = load_unit(PLUGIN_API, '_mint_for')
@@ -105,48 +105,24 @@ def test_constructed_voice_prompts(profile, allow_chat, language):
     ns['_send_to_chat_tool'].__globals__['_SEND_TO_CHAT_DESC'] = 'Send work to the chat.'
     ns['_mint_for'](profile, 'marin', allow_chat, language)
     prompt = captured['instructions']
-    assert (('VOICE + CHAT:' if language == 'en' else 'VOZ + CHAT:') in prompt) == allow_chat
+    spoken = 'Speak Danish.' if language == 'da' else 'Speak English.'
+    assert ('VOICE + CHAT:' in prompt) == allow_chat
     if allow_chat:
-        assert ('complete request phrased naturally in their language' if language == 'en' else 'petición completa y natural en su idioma') in prompt
-    assert ('LANGUAGE AND VOICE:' if language == 'en' else 'IDIOMA Y VOZ:') in prompt
+        assert 'complete request phrased naturally in their language' in prompt
+    assert 'LANGUAGE AND VOICE: ' + spoken in prompt
+    assert not any(word in prompt for word in ('IDIOMA', 'VOZ', 'IDENTIDAD', 'Spanish', 'dale'))
     assert 'Do NOT delegate greetings' in prompt
     assert all(text in prompt for text in sections.values())
     persona = load_unit(PLUGIN_API, '_codexlive_persona')
     persona.update(ns)
     prompt = persona['_codexlive_persona'](profile, language)
-    assert ('VOICE: You are speaking' if language == 'en' else 'VOZ: hablas') in prompt
-    assert ('IDENTITY: You are ' if language == 'en' else 'IDENTIDAD: eres ') + ('Example Bot' if profile else 'Luna') in prompt
+    assert 'VOICE: You are speaking' in prompt and 'LANGUAGE AND VOICE: ' + spoken in prompt
+    assert 'IDENTITY: You are ' + ('Example Bot' if profile else 'Luna') in prompt
+    assert not any(word in prompt for word in ('IDIOMA', 'VOZ', 'IDENTIDAD', 'Spanish', 'dale'))
     assert all(text in prompt for text in sections.values())
 
 
-@pytest.mark.parametrize('mode', ['client', 'server'])
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
-def test_codex_start_sends_localized_delegation_instructions(mode, language):
-    ns = load_unit(PLUGIN_API, '_codexlive_start')
-    ns.update(constants())
-    ns.update(_CL={'notifs': []}, _cl_ensure=lambda: None,
-              _cl_thread_ensure=lambda lang: 'thread', _codexlive_persona=lambda _, lang: 'persona',
-              _talk_settings=lambda: {'delegation': mode})
-    captured = {}
-
-    def request(method, params, **kwargs):
-        if method == 'thread/realtime/start':
-            captured.update(params)
-            ns['_CL']['notifs'].append({'method': 'thread/realtime/sdp', 'params': {'sdp': 'stub'}})
-        return {}
-
-    ns['_cl_request'] = request
-    ns['_codexlive_start'](None, 'cove', 'stub', language)
-    instruction = captured['realtimeStartInstructions']
-    assert instruction.startswith('You are connected to a live voice session' if language == 'en' else 'Estás conectado a una sesión de voz en vivo')
-    if mode == 'client':
-        assert '<realtime_delegation>' in instruction
-        assert ('do NOT read files: reply with only the word: skip' if language == 'en' else 'NO leas archivos: responde únicamente la palabra: skip') in instruction
-    else:
-        assert ('carry it out with your tools' if language == 'en' else 'actúala con tus herramientas') in instruction
-
-
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'da'])
 def test_tool_timeout_and_dynamic_output(language):
     ns = load_unit(PLUGIN_API, 'run_tool')
     output = 'Resultado original en español.'
@@ -166,22 +142,20 @@ def test_tool_timeout_and_dynamic_output(language):
 
     assert asyncio.run(ns['run_tool'](Request()))['output'] == output
     output = None
-    assert asyncio.run(ns['run_tool'](Request()))['output'].startswith('The tool example is still running;' if language == 'en' else 'La herramienta example sigue corriendo;')
-    tools = vendor_module('talk_tools')
-    with pytest.raises(tools.TalkToolError, match="the voice tool 'example' is not available" if language == "en" else "la tool de voz 'example' no está disponible"):
-        tools.execute_talk_tool('example', {}, language)
+    assert asyncio.run(ns['run_tool'](Request()))['output'].startswith('The tool example is still running;')
 
 
-@pytest.mark.parametrize('english', [False, True])
-def test_desktop_model_messages(english):
+@pytest.mark.parametrize('voice_lang', ['en', 'da'])
+def test_desktop_model_messages(voice_lang):
     source = (REPO / 'desktop/plugin.js').read_text()
     # Evaluate the real delegation functions with only host/time/transport boundaries stubbed.
     delegation = source[source.index('const _voiceNote ='):source.index('// ── Barge-in')]
     preview = source[source.index('  const phrase ='):source.index('  const url = await new Promise', source.index('  const phrase ='))]
     script = r'''
 const assert = require('node:assert/strict');
-const EN = EN_VALUE;
-const tr = (es, en) => EN ? en : es;
+const EN = true;
+const VOICE_LANG = 'VOICE_LANG_VALUE';
+const tr = (es, en) => en;
 let _delegating = null, _delegBusy = false, _delegQueue = null;
 let handoffMode = 'client';
 const transcript = [], pushTranscript = () => {}, KEY_CHAT = 'chat';
@@ -229,7 +203,7 @@ DELEGATION
   assert.equal(messages[2].item.output, completion);
   await runVoiceTool({rest: async () => { throw new Error('fallo original'); }}, 'call', 'probe', {}, dc);
   assert.equal(messages.at(-2).item.output, tr('La herramienta probe falló: fallo original', 'The tool probe failed: fallo original'));
-  await runVoiceTool({rest: async (path, options) => { assert.equal(options.body.language, EN ? 'en' : 'es'); return {output: completion}; }}, 'call', 'probe', {}, dc);
+  await runVoiceTool({rest: async (path, options) => { assert.equal(options.body.language, VOICE_LANG); return {output: completion}; }}, 'call', 'probe', {}, dc);
   assert.equal(messages.at(-2).item.output, completion);
   const msg = text => ({item: {id: 'item', content: [{text}]}});
   handleDelegation(ctx, msg('hola, ¿me escuchas?'), dc);
@@ -263,24 +237,21 @@ DELEGATION
     assert.ok(!text.includes('Nacho'));
   }
 })().catch(e => { console.error(e); process.exitCode = 1; });
-'''.replace('EN_VALUE', str(english).lower()).replace('DELEGATION', delegation).replace('PREVIEW', preview)
+'''.replace('VOICE_LANG_VALUE', voice_lang).replace('DELEGATION', delegation).replace('PREVIEW', preview)
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize('route', ['create_session', 'codexlive_session'])
-def test_session_routes_keep_request_language_isolated(route):
+def test_session_route_keeps_request_language_isolated():
+    # The Codex Live route's language isolation is covered in test_codexlive_broker.py.
     import threading
+    route = 'create_session'
     ns = load_unit(PLUGIN_API, route)
     calls = []
     def mint(profile, voice, allow_chat, language):
         calls.append(language)
         return SimpleNamespace(to_wire=lambda: {'language': language}), SimpleNamespace(source='stub')
-    def start(profile, voice, offer, language):
-        calls.append(language)
-        return {'language': language}
-    ns.update(_MINT_LOCK=threading.Lock(), _CL_LOCK=threading.Lock(),
-              _resolve_voice=lambda value: 'marin', _mint_for=mint, _codexlive_start=start)
+    ns.update(_MINT_LOCK=threading.Lock(), _resolve_voice=lambda value: 'marin', _mint_for=mint)
     class Request:
         def __init__(self, language):
             self.language = language
@@ -293,37 +264,25 @@ def test_session_routes_keep_request_language_isolated(route):
     assert sorted(str(v) for v in calls) == ['None', 'en', 'es']
 
 
-def test_codex_thread_reuse_includes_language():
-    from pathlib import Path
-    ns = load_unit(PLUGIN_API, '_cl_thread_ensure')
-    calls = []
-    def request(method, body, **kwargs):
-        calls.append(body)
-        return {'thread': {'id': str(len(calls))}}
-    ns.update(_CL={}, _agent_model=lambda: None, Path=Path, _cl_request=request)
-    ensure = ns['_cl_thread_ensure']
-    assert ensure() == ensure('es') == '1'
-    assert ensure('en') == ensure('en') == '2'
-    assert ensure('es') == '3'
-
-
-@pytest.mark.parametrize('english', [False, True])
-def test_desktop_session_request_bodies(english):
+@pytest.mark.parametrize('locale, voice_lang', [('da-DK', 'da'), ('da', 'da'), ('en-US', 'en'), ('es-CL', 'en'), ('', 'en')])
+def test_desktop_session_request_bodies(locale, voice_lang):
     import re
     source = (REPO / 'desktop/plugin.js').read_text()
+    declaration = re.search(r"^const VOICE_LANG = .+$", source, re.M).group(0)
     # Evaluate every production session request body, including preview's Codex path.
     bodies = re.findall(r"ctx.rest\('/(?:codexlive/)?session',\s*\{\s*method: 'POST',\s*body: (\{[^\n]+?\}),", source)
     assert len(bodies) == 3
-    script = 'const assert = require("node:assert/strict"); const EN = ' + str(english).lower() + ';'
+    script = 'const assert = require("node:assert/strict");'
+    script += f'const navigator = {{language: {locale!r}}};' + declaration + ';'
     script += 'const profile = null, voice = "cove", offer = {sdp: "stub"}, allowChat = true;'
     for body in bodies:
-        script += f'assert.equal(({body}).language, EN ? "en" : "es");'
+        script += f'assert.equal(({body}).language, {voice_lang!r});'
     result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize('language', [None, 'es', 'en'])
-def test_tool_route_localizes_unavailable_error(language):
+@pytest.mark.parametrize('language', [None, 'es', 'en', 'da'])
+def test_tool_route_reports_unavailable_tool_in_english(language):
     ns = load_unit(PLUGIN_API, 'run_tool')
     class HTTPException(Exception):
         def __init__(self, status_code, detail):
@@ -334,4 +293,4 @@ def test_tool_route_localizes_unavailable_error(language):
             return {'name': 'probe', 'language': language}
     with pytest.raises(HTTPException) as exc:
         asyncio.run(ns['run_tool'](Request()))
-    assert ('the voice tool' if language == 'en' else 'la tool de voz') in exc.value.detail
+    assert "the voice tool 'probe' is not available" in exc.value.detail

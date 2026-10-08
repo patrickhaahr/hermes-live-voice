@@ -34,16 +34,18 @@ for the voice lane.
 ## Features
 
 - 🎧 **Full-duplex, interruptible voice** over WebRTC — audio goes device ↔ model directly (the server only brokers the session).
-- 🤖 **Persona-aware** — the voice session adopts the active bot's `SOUL.md` identity and language.
+- 🤖 **Persona-aware** — the voice session adopts the active bot's `SOUL.md` identity.
+- 🗣️ **English or Danish** — the voice answers in English or Danish only (Danish by default on a Danish desktop locale); see [`docs/model-context-language.md`](docs/model-context-language.md).
 - 📝 **Live transcript** — iMessage-style bubbles (you / bot), streaming deltas, tool activity chips.
-- 🛠️ **Tools from voice** — the model can run tasks: by default they are delegated into your **focused Hermes chat**, i.e. your own agent with **your** models and providers. A voice-side delegation policy keeps this clean (only real task requests are delegated, fillers stay conversational) and an internal queue prevents overlapping runs. An opt-in server-agent mode also exists.
+- 🛠️ **Tools from voice** — the model can run tasks: by default they are delegated into your **focused Hermes chat**, i.e. your own agent with **your** models and providers. A voice-side delegation policy keeps this clean (only real task requests are delegated, fillers stay conversational) and an internal queue prevents overlapping runs. Tasks never run on the backend's Codex thread: the broker blocks that lane (see *Call isolation and task execution*).
 - 🎚️ **Audio & call controls** — device pickers, built-in mic test, one-tap **mute** and hang-up right in the composer.
 - 📊 **Usage panels** — measured voice minutes (rolling windows) and the Codex plan bucket.
 
 ## Requirements
 
 - **Hermes Agent** (backend) and **Hermes Desktop** (app).
-- **`codex` CLI ≥ 0.154**, logged in with a ChatGPT plan (`codex login` — device auth).
+- **`codex` CLI ≥ 0.160** (validated: **0.160.0**), logged in with a ChatGPT plan (`codex login` — device auth). Older
+  app-servers are refused because they cannot confirm the voice thread's execution restrictions.
 - Python 3.11+ for the backend half.
 
 ## Install
@@ -96,8 +98,11 @@ The desktop app discovers the desktop half from the plugin folder
 
 | key | values | default | meaning |
 |---|---|---|---|
-| `codexAgentModel` | a ChatGPT-valid Codex model slug (e.g. `gpt-5.6-sol`) | *(unset)* | Model forced for the delegated **server agent** thread. Needed only when the machine's default Codex model is not ChatGPT-valid (e.g. a custom provider proxy). |
-| `delegation` | `client` · `server` | `client` | Who runs voice-delegated tasks. **`client`** = the tasks run in your focused Hermes chat (your config/providers — recommended, nothing is sent to the ChatGPT lane). **`server`** = tasks run in a Codex agent thread on the backend (advanced/opt-in). |
+| `codexAgentModel` | a ChatGPT-valid Codex model slug (e.g. `gpt-5.6-sol`) | *(unset)* | Model for each call's backing Codex thread. Needed only when the machine's default Codex model is not ChatGPT-valid (e.g. a custom provider proxy) and `thread/start` fails. |
+| `delegation` | `client` | `client` | Voice-delegated tasks run in your focused Hermes chat. `server` (tasks in a Codex agent thread) was removed in 0.3.0; a call configured for it fails with `LIVE_UNSUPPORTED` instead of switching execution lanes. |
+
+The backend also reads `TALK_CODEX_BINARY` (an absolute path to the `codex` executable to use) and
+`TALK_CODEX_AGENT_MODEL` (overrides `codexAgentModel`) from its environment.
 
 ## Troubleshooting
 
@@ -151,12 +156,39 @@ focused Hermes chat and feeds the result back to the voice model to speak.
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Call isolation and task execution
+
+Several clients (for example a desktop and a phone) can be in calls at the same time. One `codex
+app-server` process serves them all, but every call owns a **fresh ephemeral thread**: the SDP answer,
+errors, closes, interruptions and stops are routed by that thread's id, so starting, failing,
+interrupting or hanging up one call never touches another, and no voice context carries over between
+calls. `POST /codexlive/session` returns the call's `threadId`; `/codexlive/stop` and
+`/codexlive/interrupt` require it and act only on that live call. A startup that has not produced an
+answer within 20 seconds fails and is closed, and an answer for a client that already disconnected is
+closed rather than left running.
+
+The realtime core still opens a Codex turn on the call's backing thread for every delegation, even
+with client-managed handoffs. The broker does not rely on a prompt to keep that turn idle: the thread
+is created with no environment access, a read-only, network-less sandbox and approvals routed to the
+broker, which declines all of them; the app-server runs with its tool features (shell, apps, plugins,
+browser, web search and so on) disabled; and every backing turn is interrupted as it starts. The
+broker logs each backing turn's outcome (`ended interrupted with 0 items`) and warns if one ever runs an
+execution item. Calls fail with a coded error instead of degrading:
+
+| error | meaning |
+|---|---|
+| `LIVE_UNSUPPORTED` | `codex` is older than the validated version, rejected a required field, or `settings.json` asks for server delegation |
+| `LIVE_UNSAFE` | the app-server accepted the thread but did not confirm its restrictions |
+| `LIVE_TIMEOUT` | no SDP answer within 20 seconds |
+| `LIVE_START_FAILED` | the service refused or closed the session |
+| `LIVE_SIN_QUOTA` | the ChatGPT plan's voice allowance is used up |
+
 Full engineering recipe, protocol tables and gotchas:
 **[`docs/live-voice-recipe.md`](docs/live-voice-recipe.md)**.
 
 ## Status & roadmap
 
-⚠️ **Preview (0.2.x).** The backend resolves its voice plumbing at import time in this order: the
+⚠️ **Preview (0.3.x).** The backend resolves its voice plumbing at import time in this order: the
 full [`hermes-talk`](https://github.com/TheSmokeDev/hermes-talk) plugin when it is installed (richer
 — native voice tools, run steering, cascade modes), otherwise the MIT-licensed fallback bundled in
 `dashboard/talk_vendor/`, so a fresh install with no other plugin mounts correctly (covered by a
@@ -166,6 +198,8 @@ Live Voice implementation and the protocol documentation are included here for r
 integration work.
 
 ## Changelog
+
+- **0.3.0** — call-scoped broker. Each Codex Live call gets its own fresh thread, and every app-server response and notification is routed to the call that owns it, so a desktop and a phone can be in calls at once without one stopping, replacing or inheriting the other (previously all calls shared one cached thread, and a failed start could stop a healthy call). Stop and interrupt now require the call's `threadId`. The backing Codex thread can no longer execute delegated work (restricted thread, declined approvals, disabled tool features, every backing turn interrupted); `delegation: server` and the silent fallback when an app-server drops `clientManagedHandoffs` are gone, replaced by coded failures. Requires codex 0.160 or newer. Startup is bounded at 20 seconds. The voice speaks English or Danish only (it used to default to Chilean Spanish), the desktop UI and all model-facing text are English, and broker errors are English.
 
 - **0.2.2** — identity and language polish, on top of community fixes by [@tillstriegel](https://github.com/tillstriegel) ([#4](https://github.com/Synero/hermes-live-voice/pull/4)): the voice identity prompt no longer hardcodes the owner's name, the model-facing voice context follows the session language (es/en), and — fixed here — the delegated-thread recovery path now keeps that language instead of silently recreating the thread in the fallback while the previous run was in the other language. Also: the transcript's user label is localized ("Tú"/"You") rather than a hardcoded name, and the identity docstring no longer lists private bot names. **Why it matters:** the plugin runs on other people's machines, so no installer should ever see someone else's name in the prompt or in the UI.
 - **0.2.1** — audit fixes: the backend now imports its **bundled** `talk_vendor` fallback on fresh installs (previously it needed `hermes-talk` installed); a concurrent `/session` pair no longer deadlocks the event loop; app-server RPC correlation survives reader-buffer pruning; `/codexlive/interrupt` runs off the event loop; `CODEX_HOME` is honored consistently across login/backup/logout; when an older app-server drops `clientManagedHandoffs` the response now carries `droppedFields`/`handoffDegraded`/`warning` and the desktop shows a notice instead of failing silently; the desktop interrupt call sends a plain object body (no double-encoding) and a muted mic can no longer be un-muted by barge-in.
@@ -178,8 +212,14 @@ integration work.
 python -m pytest -q
 ```
 
-Regression tests for the audit findings in issue #1 (no network, no `codex` binary, no OpenAI
-calls — stdlib + pytest only). CI additionally verifies the bundled fallback imports on a
+Regression tests for the audit findings in issue #1 and the call-scoped broker (no network, no
+`codex` binary, no OpenAI calls — pytest, fastapi and httpx). `tests/test_codexlive_broker.py` drives
+the real routes against `tests/fake_codex_app_server.py`, a stand-in for `codex app-server` that only
+emits per-thread events; it proves the broker's routing, not the subscription service.
+
+`tools/live_call_check.py` is the live counterpart: two WebRTC reference clients make overlapping
+**real** calls on the local Codex login (it spends voice allowance) and check delegation, barge-in,
+hang-up in both directions and the backing-thread guard. See the recipe for the last recorded run. CI additionally verifies the bundled fallback imports on a
 clean environment (empty `HOME`, no site-packages), compiles the backend, syntax-checks the
 desktop half and runs the ESM load harness.
 
