@@ -3,8 +3,10 @@
 
 This places REAL calls on the ChatGPT subscription the local `codex login`
 belongs to and spends its voice allowance (a run takes about two minutes of two
-calls). It mounts this checkout's broker routes in-process, without the Hermes
-dashboard, and drives them with two WebRTC clients that speak recorded WAV
+calls). By default it mounts this checkout's broker routes in-process; with
+--url it drives a running Hermes dashboard instead (the deployed plugin), sending
+$HERMES_DASHBOARD_SESSION_TOKEN as the dashboard session token and reading the
+broker's log lines from --hermes-log. Two WebRTC clients speak recorded WAV
 utterances and read the realtime data channel.
 
 Requirements: `pip install aiortc numpy fastapi httpx` and a directory with
@@ -12,15 +14,20 @@ Requirements: `pip install aiortc numpy fastapi httpx` and a directory with
 still.wav (see docs/live-voice-recipe.md for the phrases used).
 
     python tools/live_call_check.py /path/to/wavs
+    HERMES_DASHBOARD_SESSION_TOKEN=... python tools/live_call_check.py /path/to/wavs \
+        --url http://127.0.0.1:9139/api/plugins/talk-desktop --hermes-log ~/.hermes/logs/gui.log
 
 The script prints one JSON report and exits non-zero if a check failed.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
+import contextlib
 import importlib.util
 import json
 import logging
+import os
 import sys
 import time
 import wave
@@ -195,7 +202,7 @@ async def barge_in(client: Client, wavs: Path, other: Client) -> dict:
     }
 
 
-async def main(wavs: Path) -> int:
+async def main(wavs: Path, url: str | None, hermes_log: Path | None) -> int:
     records: list[logging.LogRecord] = []
 
     class Keep(logging.Handler):
@@ -209,15 +216,22 @@ async def main(wavs: Path) -> int:
     echo.setFormatter(logging.Formatter("%(relativeCreated)9.0fms broker %(message)s"))
     logger.addHandler(echo)
 
-    spec = importlib.util.spec_from_file_location("talk_desktop_plugin_api", REPO / "dashboard" / "plugin_api.py")
-    plugin = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(plugin)
-    app = FastAPI()
-    app.include_router(plugin.router)
-    report: dict = {"checks": {}}
+    plugin = None
+    if url:
+        log_offset = hermes_log.stat().st_size if hermes_log else 0
+        client = httpx.AsyncClient(base_url=url.rstrip("/"), timeout=60, headers={
+            "X-Hermes-Session-Token": os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")})
+    else:
+        spec = importlib.util.spec_from_file_location("talk_desktop_plugin_api", REPO / "dashboard" / "plugin_api.py")
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        app = FastAPI()
+        app.include_router(plugin.router)
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://broker", timeout=60)
+    report: dict = {"checks": {}, "target": url or "in-process"}
     t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://broker", timeout=60) as http:
+        async with client as http:
             desktop, phone = Client("desktop", http, t0), Client("phone", http, t0)
             phone.delegation_reply = "Task result (answer the user with this): the server has forty-two gigabytes free."
 
@@ -254,9 +268,19 @@ async def main(wavs: Path) -> int:
                 and bool(report["phoneAfterDesktopHangUp"]) and bool(report["desktopAfterPhoneHangUp"]))
             await asyncio.sleep(2)
     finally:
-        plugin._LIVE.close()
+        if plugin is not None:
+            plugin._LIVE.close()
 
-    messages = [r.getMessage() for r in records]
+    if url:
+        messages = []
+        if hermes_log:
+            with contextlib.suppress(OSError), hermes_log.open(encoding="utf-8", errors="replace") as fh:
+                fh.seek(log_offset)
+                messages = [line.split("hermes.plugins.talk-desktop: ", 1)[-1].strip()
+                            for line in fh if "codex live:" in line]
+    else:
+        messages = [r.getMessage() for r in records]
+    report["brokerLog"] = messages
     report["backingTurnsInterrupted"] = sum("interrupting backing turn" in m for m in messages)
     report["backingExecutionItems"] = [m for m in messages if "backing thread started" in m]
     report["declinedBackingRequests"] = [m for m in messages if "declined backing-thread request" in m]
@@ -273,6 +297,9 @@ async def main(wavs: Path) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    sys.exit(asyncio.run(main(Path(sys.argv[1]))))
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("wavs", type=Path)
+    parser.add_argument("--url", help="talk-desktop route prefix of a running dashboard")
+    parser.add_argument("--hermes-log", type=Path, help="Hermes log file that receives the broker's log lines")
+    args = parser.parse_args()
+    sys.exit(asyncio.run(main(args.wavs, args.url, args.hermes_log)))

@@ -1038,7 +1038,10 @@ class _LiveBroker:
         def remaining() -> float:
             return max(0.1, deadline - time.monotonic())
 
+        began = time.monotonic()
+        marks: dict[str, float] = {}
         server = self._ensure_server()
+        marks["server"] = time.monotonic()
         body = {
             "cwd": server.cwd, "modelProvider": "openai", "ephemeral": True,
             "environments": [], "sandbox": "read-only", "approvalPolicy": "untrusted",
@@ -1047,6 +1050,7 @@ class _LiveBroker:
             body["model"] = model
         try:
             started = server.request("thread/start", body, timeout=remaining()) or {}
+            marks["thread"] = time.monotonic()
         except TimeoutError as exc:
             raise LiveCallError("LIVE_TIMEOUT", str(exc)) from exc
         except RuntimeError as exc:
@@ -1080,6 +1084,7 @@ class _LiveBroker:
             }
             try:
                 server.request("thread/realtime/start", params, timeout=remaining())
+                marks["realtime/start"] = time.monotonic()
             except TimeoutError as exc:
                 raise LiveCallError("LIVE_TIMEOUT", str(exc)) from exc
             except RuntimeError as exc:
@@ -1095,6 +1100,7 @@ class _LiveBroker:
                 raise LiveCallError("LIVE_START_FAILED", str(exc)) from exc
             if not call.settled.wait(remaining()):
                 raise LiveCallError("LIVE_TIMEOUT", "codex live: no SDP answer")
+            marks["sdp"] = time.monotonic()
             if call.error:
                 raise LiveCallError("LIVE_START_FAILED", "codex live: " + call.error)
             if not call.answer:
@@ -1102,6 +1108,12 @@ class _LiveBroker:
         except BaseException:
             self._end(call)
             raise
+        finally:
+            steps, last = [], began
+            for step, at in marks.items():
+                steps.append(f"{step} {at - last:.2f}s")
+                last = at
+            _log.info("codex live: call %s startup %.2fs (%s)", tid, time.monotonic() - began, ", ".join(steps))
         return {
             "answer": call.answer,
             "realtimeSessionId": call.session_id,
