@@ -1227,6 +1227,35 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
     )
 
 
+
+# ── Public API for other Hermes plugins ──────────────────────────────────────
+#
+# Hermes Gadget lets a paired phone make Live calls. Its server half runs in the
+# gateway process, which does not serve these dashboard routes and holds no
+# dashboard credential, so it loads this module and drives a broker of its own
+# (with its own app-server) in that process. Every guarantee above applies:
+# each call owns a fresh restricted thread, and stop reaches only its own call.
+
+MIN_CODEX_VERSION = _CODEX_MIN_VERSION
+
+
+def start_call(*, profile: str | None, offer: str, voice: str = "cove", language: str = "en") -> dict:
+    """Start one isolated call and return its SDP answer and threadId (blocking).
+
+    Raises LiveCallError (its `code` says why) and never falls back to another
+    voice lane. `profile` must be a Hermes profile name, or None for the default.
+    """
+    if profile and _profile_home(profile) is None:
+        raise LiveCallError("LIVE_BAD_PROFILE", f"profile '{profile}' does not exist")
+    if not offer:
+        raise LiveCallError("LIVE_BAD_OFFER", "the SDP offer is missing")
+    return _codexlive_start(profile, voice, offer, language)
+
+
+def stop_call(thread_id: str) -> bool:
+    """Hang up the call that owns `thread_id`; False if no such call is live."""
+    return _LIVE.stop_call(thread_id)
+
 if router is not None:
     @router.post("/codexlive/session")
     async def codexlive_session(request: Request) -> dict:

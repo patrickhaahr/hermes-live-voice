@@ -247,3 +247,32 @@ def test_answer_for_a_departed_client_is_not_left_running(plugin_factory):
     assert len(started) == 1
     assert plugin.stopped_threads() == [started[0]["threadId"]]
     assert sent[0]["status"] != 200
+
+
+def test_the_public_api_starts_isolated_calls_outside_the_dashboard(plugin_factory):
+    """Hermes Gadget drives the broker from the gateway process, without the HTTP routes."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    plugin = plugin_factory()
+    api = plugin.module
+    with ThreadPoolExecutor(2) as pool:
+        slow = pool.submit(api.start_call, profile=None, offer="offer-desktop slow", language="da")
+        phone = pool.submit(api.start_call, profile=None, offer="offer-phone", language="en").result()
+        desktop = slow.result()
+    assert phone["answer"] == "answer:offer-phone" and desktop["threadId"] != phone["threadId"]
+    starts = {p["threadId"]: p for p in plugin.params("thread/realtime/start")}
+    assert "LANGUAGE AND VOICE: Speak English." in starts[phone["threadId"]]["prompt"]
+    assert starts[phone["threadId"]]["clientManagedHandoffs"] is True
+
+    assert api.stop_call(phone["threadId"]) is True
+    assert api.stop_call(phone["threadId"]) is False
+    assert plugin.stopped_threads() == [phone["threadId"]]
+
+    with pytest.raises(api.LiveCallError) as refused:
+        api.start_call(profile="nobody", offer="offer-phone-2")
+    assert refused.value.code == "LIVE_BAD_PROFILE"
+    with pytest.raises(api.LiveCallError) as failed:
+        api.start_call(profile=None, offer="offer-phone fail")
+    assert failed.value.code == "LIVE_START_FAILED"
+    assert len(plugin.params("thread/realtime/start")) == 3, "a refused profile started nothing"
+    assert desktop["threadId"] not in plugin.stopped_threads()
