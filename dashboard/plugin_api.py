@@ -1151,7 +1151,7 @@ _LIVE = _LiveBroker()
 atexit.register(_LIVE.close)
 
 
-def _codexlive_persona(profile: str | None, language: str | None = "en") -> str:
+def _codexlive_persona(profile: str | None, language: str | None = "en", *, phone: bool = False) -> str:
     if profile:
         sections = _bot_identity_sections(profile)
         name = _bot_display_name(profile)
@@ -1166,7 +1166,7 @@ def _codexlive_persona(profile: str | None, language: str | None = "en") -> str:
         f"\n\nVOICE: You are speaking with the user in a live voice session. Keep replies brief, natural, and to the point."
         f" IDENTITY: You are {name}; if asked who you are, answer as {name} in that role — never as a generic assistant."
     )
-    base += _VOICE_POLICY
+    base += _PHONE_VOICE_POLICY if phone else _VOICE_POLICY
     return base
 
 
@@ -1190,6 +1190,18 @@ _VOICE_POLICY = (
     "- When the result arrives, read the key facts back in one or two short sentences."
 )
 
+# Device calls have one admitted Hermes task and explicit busy receipts, rather
+# than the desktop client's queue. Ordinary conversation remains available.
+_PHONE_VOICE_POLICY = (
+    "\n\nVOICE DELEGATION POLICY (phone call):\n"
+    "- Delegate only requests that need Hermes to act or check real information. Hermes executes them in the phone's existing gadget conversation.\n"
+    "- Answer greetings, small talk, general knowledge and requests for a story yourself; do not delegate them. If unclear, ask one short clarifying question.\n"
+    "- While Hermes works, continue ordinary conversation when the user speaks. Do not invent task results. If asked for progress, say Hermes is still working.\n"
+    "- Another task may receive a busy response. Tell the user to wait and ask again after the current task finishes; never queue, repeat or replace a task.\n"
+    "- Approval questions use the phone's on-screen controls. Do not accept spoken approvals.\n"
+    "- When a task result arrives, give its key facts briefly, once."
+)
+
 
 def _talk_settings() -> dict:
     try:
@@ -1211,7 +1223,7 @@ def _agent_model() -> str | None:
     return v or None
 
 
-def _codexlive_start(profile: str | None, voice: str, offer: str, language: str | None = "en") -> dict:
+def _codexlive_start(profile: str | None, voice: str, offer: str, language: str | None = "en", *, phone: bool = False) -> dict:
     if str(_talk_settings().get("delegation") or "client").strip().lower() == "server":
         raise LiveCallError(
             "LIVE_UNSUPPORTED",
@@ -1219,7 +1231,7 @@ def _codexlive_start(profile: str | None, voice: str, offer: str, language: str 
             "thread: voice tasks run in the Hermes chat. Remove that setting.",
         )
     return _LIVE.start_call(
-        persona=_codexlive_persona(profile, language),
+        persona=_codexlive_persona(profile, language, phone=phone),
         start_instructions=_AGENT_INSTR_SKIP,
         voice=voice,
         offer=offer,
@@ -1249,7 +1261,7 @@ def start_call(*, profile: str | None, offer: str, voice: str = "cove", language
         raise LiveCallError("LIVE_BAD_PROFILE", f"profile '{profile}' does not exist")
     if not offer:
         raise LiveCallError("LIVE_BAD_OFFER", "the SDP offer is missing")
-    return _codexlive_start(profile, voice, offer, language)
+    return _codexlive_start(profile, voice, offer, language, phone=True)
 
 
 def stop_call(thread_id: str) -> bool:

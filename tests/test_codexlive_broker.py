@@ -263,6 +263,14 @@ def test_the_public_api_starts_isolated_calls_outside_the_dashboard(plugin_facto
     starts = {p["threadId"]: p for p in plugin.params("thread/realtime/start")}
     assert "LANGUAGE AND VOICE: Speak English." in starts[phone["threadId"]]["prompt"]
     assert starts[phone["threadId"]]["clientManagedHandoffs"] is True
+    assert "continue ordinary conversation" in starts[phone["threadId"]]["prompt"]
+    assert "Answer greetings, small talk, general knowledge and requests for a story yourself" in starts[phone["threadId"]]["prompt"]
+    assert "never queue, repeat or replace a task" in starts[phone["threadId"]]["prompt"]
+    # The dashboard retains its own queue/wait policy; only the public device API changes.
+    dashboard = plugin.call("offer-dashboard").json()
+    dashboard_start = plugin.params("thread/realtime/start")[-1]
+    assert dashboard_start["threadId"] == dashboard["threadId"]
+    assert "WAIT silently" in dashboard_start["prompt"]
 
     assert api.stop_call(phone["threadId"]) is True
     assert api.stop_call(phone["threadId"]) is False
@@ -274,5 +282,5 @@ def test_the_public_api_starts_isolated_calls_outside_the_dashboard(plugin_facto
     with pytest.raises(api.LiveCallError) as failed:
         api.start_call(profile=None, offer="offer-phone fail")
     assert failed.value.code == "LIVE_START_FAILED"
-    assert len(plugin.params("thread/realtime/start")) == 3, "a refused profile started nothing"
+    assert len(plugin.params("thread/realtime/start")) == 4, "a refused profile started nothing"
     assert desktop["threadId"] not in plugin.stopped_threads()
