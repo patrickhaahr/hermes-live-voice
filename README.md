@@ -183,6 +183,15 @@ execution item. Calls fail with a coded error instead of degrading:
 | `LIVE_START_FAILED` | the service refused or closed the session |
 | `LIVE_SIN_QUOTA` | the ChatGPT plan's voice allowance is used up |
 
+### Calls from other plugins
+
+Another Hermes plugin can start calls without the dashboard routes. [Hermes Gadget](https://github.com/Adolanium/hermes-gadget-sdk) uses this for paired Android phones: its gateway process can't call these routes without a dashboard login. Load `dashboard/plugin_api.py` from this plugin's directory and call:
+
+- `start_call(profile=None, offer=<SDP offer>, voice="cove", language="en")`: blocks until the call has its SDP answer and returns `{"answer", "threadId", ...}`. It raises `LiveCallError` with one of the codes above, or `LIVE_BAD_PROFILE` or `LIVE_BAD_OFFER`.
+- `stop_call(threadId)` hangs up that call only and returns whether it was live.
+
+The loading process runs its own broker and `codex app-server` with the same isolation, thread restrictions and 20-second startup bound. It shares no call state with the dashboard's broker.
+
 Full engineering recipe, protocol tables and gotchas:
 **[`docs/live-voice-recipe.md`](docs/live-voice-recipe.md)**.
 
@@ -199,6 +208,7 @@ integration work.
 
 ## Changelog
 
+- **Unreleased** — `start_call` / `stop_call`: a public API for other plugins to start isolated calls in their own process (used by Hermes Gadget for phone calls). The HTTP routes are unchanged.
 - **0.3.0** — call-scoped broker. Each Codex Live call gets its own fresh thread, and every app-server response and notification is routed to the call that owns it, so a desktop and a phone can be in calls at once without one stopping, replacing or inheriting the other (previously all calls shared one cached thread, and a failed start could stop a healthy call). Stop and interrupt now require the call's `threadId`. The backing Codex thread can no longer execute delegated work (restricted thread, declined approvals, disabled tool features, every backing turn interrupted); `delegation: server` and the silent fallback when an app-server drops `clientManagedHandoffs` are gone, replaced by coded failures. Requires codex 0.160 or newer. Startup is bounded at 20 seconds. The voice speaks English or Danish only (it used to default to Chilean Spanish), the desktop UI and all model-facing text are English, and broker errors are English.
 
 - **0.2.2** — identity and language polish, on top of community fixes by [@tillstriegel](https://github.com/tillstriegel) ([#4](https://github.com/Synero/hermes-live-voice/pull/4)): the voice identity prompt no longer hardcodes the owner's name, the model-facing voice context follows the session language (es/en), and — fixed here — the delegated-thread recovery path now keeps that language instead of silently recreating the thread in the fallback while the previous run was in the other language. Also: the transcript's user label is localized ("Tú"/"You") rather than a hardcoded name, and the identity docstring no longer lists private bot names. **Why it matters:** the plugin runs on other people's machines, so no installer should ever see someone else's name in the prompt or in the UI.
