@@ -192,6 +192,8 @@ Another Hermes plugin can start calls without the dashboard routes. [Hermes Gadg
 
 The loading process runs its own broker and `codex app-server` with the same isolation, thread restrictions and 20-second startup bound. It shares no call state with the dashboard's broker.
 
+The public `start_call` API uses the phone conversation policy: the voice answers stories and casual conversation itself, remains conversational while Hermes works, and explains busy receipts without queuing or replacing requests. Tasks and approvals still belong to Hermes and the client's on-screen controls. The dashboard routes retain the desktop's queue/wait policy.
+
 Full engineering recipe, protocol tables and gotchas:
 **[`docs/live-voice-recipe.md`](docs/live-voice-recipe.md)**.
 
@@ -207,6 +209,8 @@ Live Voice implementation and the protocol documentation are included here for r
 integration work.
 
 ## Changelog
+
+- **Unreleased** — phone calls keep casual conversation available during Hermes tasks and answer stories directly. The public device API tells the voice to respect busy receipts and on-screen approvals; desktop policy and execution restrictions are unchanged.
 
 - **Unreleased** — `start_call` / `stop_call`: a public API for other plugins to start isolated calls in their own process (used by Hermes Gadget for phone calls). The HTTP routes are unchanged.
 - **0.3.0** — call-scoped broker. Each Codex Live call gets its own fresh thread, and every app-server response and notification is routed to the call that owns it, so a desktop and a phone can be in calls at once without one stopping, replacing or inheriting the other (previously all calls shared one cached thread, and a failed start could stop a healthy call). Stop and interrupt now require the call's `threadId`. The backing Codex thread can no longer execute delegated work (restricted thread, declined approvals, disabled tool features, every backing turn interrupted); `delegation: server` and the silent fallback when an app-server drops `clientManagedHandoffs` are gone, replaced by coded failures. Requires codex 0.160 or newer. Startup is bounded at 20 seconds. The voice speaks English or Danish only (it used to default to Chilean Spanish), the desktop UI and all model-facing text are English, and broker errors are English.
